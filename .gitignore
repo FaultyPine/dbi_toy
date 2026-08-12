@@ -1,0 +1,7 @@
+*.exe
+*.d
+*.dll
+*.pdb
+*.ilk
+external/Dynamorio-Windows-*
+external/zydis/build

@@ -1,0 +1,9 @@
+#ifndef PEONY_SHARED_DEFINES_H
+#define PEONY_SHARED_DEFINES_H
+
+#include <stdbool.h>
+#define _CRT_SECURE_NO_WARNINGS
+
+
+
+#endif
