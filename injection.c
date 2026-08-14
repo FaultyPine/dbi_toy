@@ -27,40 +27,16 @@ DWORD WINAPI InitializeThread(LPVOID param);
 
 typedef struct
 {
-    DWORD64 r15;
-    DWORD64 r14;
-    DWORD64 r13;
-    DWORD64 r12;
-    DWORD64 r11;
-    DWORD64 r10;
-    DWORD64 r9;
-    DWORD64 r8;
-    DWORD64 rbp;
-    DWORD64 rdi;
-    DWORD64 rsi;
-    DWORD64 rdx;
-    DWORD64 rcx;
-    DWORD64 rbx;
-    DWORD64 rax;
-    DWORD64 rflags;
-    DWORD64 rsp;
-} SavedRegisterState;
-
-typedef struct
-{
-    void* originalRip;
     DWORD64 originalR10;
-    DWORD64 originalR11;
-    volatile unsigned long long basicBlockCount;
-    SavedRegisterState savedRegs;
+    CONTEXT savedRegs;
 } ThreadHijackState;
 
-_Static_assert(offsetof(ThreadHijackState, originalRip) == 0x00, "unexpected ThreadHijackState layout");
-_Static_assert(offsetof(ThreadHijackState, originalR10) == 0x08, "unexpected ThreadHijackState layout");
-_Static_assert(offsetof(ThreadHijackState, originalR11) == 0x10, "unexpected ThreadHijackState layout");
-_Static_assert(offsetof(ThreadHijackState, basicBlockCount) == 0x18, "unexpected ThreadHijackState layout");
-_Static_assert(offsetof(ThreadHijackState, savedRegs) == 0x20, "unexpected ThreadHijackState layout");
-_Static_assert(offsetof(ThreadHijackState, savedRegs.rsp) == 0xa0, "unexpected ThreadHijackState layout");
+#define SAVEDREGS_OFF_NUM 16
+#define SAVEDREGS_OFF STRINGIFY_MACRO(SAVEDREGS_OFF_NUM)
+#define ORIGR10_OFF_NUM 0
+#define ORIGR10_OFF STRINGIFY_MACRO(ORIGR10_OFF_NUM)
+_Static_assert(offsetof(ThreadHijackState, originalR10) == ORIGR10_OFF_NUM, "unexpected ThreadHijackState layout");
+_Static_assert(offsetof(ThreadHijackState, savedRegs) == SAVEDREGS_OFF_NUM, "unexpected ThreadHijackState layout");
 
 static ThreadHijackState g_hijackedThreadState;
 static SharedLogObject* g_sharedLog;
@@ -157,7 +133,7 @@ void PeonyLogf(const char* format, ...)
 
 
 __declspec(noinline)
-void OnBasicBlockEnter(ThreadHijackState* state, SavedRegisterState* savedRegs)
+void OnThreadHijack(ThreadHijackState* state)
 {
     // TODO: look at PC of this thread
     // if we have this basic block in the code cache, jump there i think?
@@ -170,9 +146,7 @@ void OnBasicBlockEnter(ThreadHijackState* state, SavedRegisterState* savedRegs)
     // copy to destination code cache block
     // patch original code to jump to our code cache block
     // make sure our code cache block jumps back to original code
-    (void)savedRegs;
-    state->basicBlockCount++;
-    PeonyLogf("basic block count inc %llu", state->basicBlockCount);
+    PeonyLogf("We have hijacked the thread!\n");
 }
 
 BOOL WINAPI DllMain(
@@ -327,98 +301,167 @@ bool ShouldWeCareAboutThisModule(SharedCommsObject* sharedComms, const ModuleInf
     return true;
 }
 
-#if defined(_M_X64) || defined(__x86_64__)
-// Called with R11 = ThreadHijackState*. The CALL return address is on the stack,
-// so saved RSP is [rsp + 8], which is the target thread's original RSP.
+_Static_assert(offsetof(CONTEXT, EFlags) == 68, "CONTEXT offset wrong");
+#define CTXOFFSET_RFLAGS STRINGIFY(68)
+_Static_assert(offsetof(CONTEXT, Rax) == 120, "CONTEXT offset wrong");
+#define CTXOFFSET_RAX STRINGIFY(120)
+_Static_assert(offsetof(CONTEXT, Rcx) == 128, "CONTEXT offset wrong");
+#define CTXOFFSET_RCX STRINGIFY(128)
+_Static_assert(offsetof(CONTEXT, Rdx) == 136, "CONTEXT offset wrong");
+#define CTXOFFSET_RDX STRINGIFY(136)
+_Static_assert(offsetof(CONTEXT, Rbx) == 144, "CONTEXT offset wrong");
+#define CTXOFFSET_RBX STRINGIFY(144)
+_Static_assert(offsetof(CONTEXT, Rsp) == 152, "CONTEXT offset wrong");
+#define CTXOFFSET_RSP STRINGIFY(152)
+_Static_assert(offsetof(CONTEXT, Rbp) == 160, "CONTEXT offset wrong");
+#define CTXOFFSET_RBP STRINGIFY(160)
+_Static_assert(offsetof(CONTEXT, Rsi) == 168, "CONTEXT offset wrong");
+#define CTXOFFSET_RSI STRINGIFY(168)
+_Static_assert(offsetof(CONTEXT, Rdi) == 176, "CONTEXT offset wrong");
+#define CTXOFFSET_RDI STRINGIFY(176)
+_Static_assert(offsetof(CONTEXT, R8) == 184, "CONTEXT offset wrong");
+#define CTXOFFSET_R8 STRINGIFY(184)
+_Static_assert(offsetof(CONTEXT, R9) == 192, "CONTEXT offset wrong");
+#define CTXOFFSET_R9 STRINGIFY(192)
+_Static_assert(offsetof(CONTEXT, R10) == 200, "CONTEXT offset wrong");
+#define CTXOFFSET_R10 STRINGIFY(200)
+_Static_assert(offsetof(CONTEXT, R11) == 208, "CONTEXT offset wrong");
+#define CTXOFFSET_R11 STRINGIFY(208)
+_Static_assert(offsetof(CONTEXT, R12) == 216, "CONTEXT offset wrong");
+#define CTXOFFSET_R12 STRINGIFY(216)
+_Static_assert(offsetof(CONTEXT, R13) == 224, "CONTEXT offset wrong");
+#define CTXOFFSET_R13 STRINGIFY(224)
+_Static_assert(offsetof(CONTEXT, R14) == 232, "CONTEXT offset wrong");
+#define CTXOFFSET_R14 STRINGIFY(232)
+_Static_assert(offsetof(CONTEXT, R15) == 240, "CONTEXT offset wrong");
+#define CTXOFFSET_R15 STRINGIFY(240)
+_Static_assert(offsetof(CONTEXT, Rip) == 248, "CONTEXT offset wrong");
+#define CTXOFFSET_RIP STRINGIFY(248)
+
+
 __attribute__((naked))
-void SaveHijackedThreadRegisters(void)
+void RestoreRegisters(void)
 {
-    // r11 is g_hijackedThreadState
+    // r10 should contain the ThreadHijackState
     __asm__(
         ".intel_syntax noprefix\n"
-        "mov qword ptr [r11 + 0x90], rax\n"
-        "mov qword ptr [r11 + 0x88], rbx\n"
-        "mov qword ptr [r11 + 0x80], rcx\n"
-        "mov qword ptr [r11 + 0x78], rdx\n"
-        "mov qword ptr [r11 + 0x70], rsi\n"
-        "mov qword ptr [r11 + 0x68], rdi\n"
-        "mov qword ptr [r11 + 0x60], rbp\n"
-        "mov qword ptr [r11 + 0x58], r8\n"
-        "mov qword ptr [r11 + 0x50], r9\n"
-        "mov rax, qword ptr [r11 + 0x8]\n"
-        "mov qword ptr [r11 + 0x48], rax\n"
-        "mov rax, qword ptr [r11 + 0x10]\n"
-        "mov qword ptr [r11 + 0x40], rax\n"
-        "mov qword ptr [r11 + 0x38], r12\n"
-        "mov qword ptr [r11 + 0x30], r13\n"
-        "mov qword ptr [r11 + 0x28], r14\n"
-        "mov qword ptr [r11 + 0x20], r15\n"
-        "pushfq\n"
-        "pop rax\n"
-        "mov qword ptr [r11 + 0x98], rax\n"
-        "lea rax, [rsp + 0x8]\n"
-        "mov qword ptr [r11 + 0xa0], rax\n"
-        "mov rax, qword ptr [r11 + 0x90]\n"
-        "ret\n"
+
+        // cpu flags restore
+        "mov eax, dword ptr [r10 + " SAVEDREGS_OFF " + " CTXOFFSET_RFLAGS "]\n" // rax = (uint32)state->savedRegs.EFlags
+        "push rax\n" // push savedRegs.EFlags onto stack
+        "popfq\n" // pop savedRegs.EFlags from stack into CPU RFlags register
+
+        "mov r15, qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R15"]\n"
+        "mov r14, qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R14"]\n"
+        "mov r13, qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R13"]\n"
+        "mov r12, qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R12"]\n"
+        "mov r11, qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R11"]\n"
+        
+        "mov r9, qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R9"]\n"
+        "mov r8, qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R8"]\n"
+        "mov rdi, qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RDI"]\n"
+        "mov rsi, qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RSI"]\n"
+        "mov rbp, qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RBP"]\n"
+        
+        "mov rbx, qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RBX"]\n"
+        "mov rdx, qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RDX"]\n"
+        "mov rcx, qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RCX"]\n"
+        "mov rax, qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RAX"]\n"
+        
+        // restore sp
+        "mov rsp, qword ptr [r10 + " SAVEDREGS_OFF " + " CTXOFFSET_RSP "]\n"
+        
+        // restore final scratch reg
+        "mov r10, qword ptr [r10 + " SAVEDREGS_OFF " + " CTXOFFSET_R10 "]\n"
+        // jump to original program Rip
+        "jmp qword ptr [rip + g_hijackedThreadState + " SAVEDREGS_OFF " + " CTXOFFSET_RIP "]\n"
+        
         ".att_syntax prefix\n"
     );
 }
 
-// Does not return. It restores the target thread state and jumps to originalRip.
+
 __attribute__((naked))
-void RestoreHijackedThreadRegisters(void)
+void SaveRegisters(void)
 {
+    // r10 should contain the ThreadHijackState
     __asm__(
         ".intel_syntax noprefix\n"
-        "mov rax, qword ptr [rcx]\n"
-        "mov rdx, qword ptr [rcx + 0xa0]\n"
-        "mov qword ptr [rdx - 0x8], rax\n"
-        "mov r15, qword ptr [rcx + 0x20]\n"
-        "mov r14, qword ptr [rcx + 0x28]\n"
-        "mov r13, qword ptr [rcx + 0x30]\n"
-        "mov r12, qword ptr [rcx + 0x38]\n"
-        "mov r11, qword ptr [rcx + 0x40]\n"
-        "mov r10, qword ptr [rcx + 0x48]\n"
-        "mov r9, qword ptr [rcx + 0x50]\n"
-        "mov r8, qword ptr [rcx + 0x58]\n"
-        "mov rbp, qword ptr [rcx + 0x60]\n"
-        "mov rdi, qword ptr [rcx + 0x68]\n"
-        "mov rsi, qword ptr [rcx + 0x70]\n"
-        "mov rdx, qword ptr [rcx + 0x78]\n"
-        "mov rbx, qword ptr [rcx + 0x88]\n"
-        "mov rax, qword ptr [rcx + 0x98]\n"
-        "push rax\n"
-        "popfq\n"
-        "mov rax, qword ptr [rcx + 0x90]\n"
-        "mov rsp, qword ptr [rcx + 0xa0]\n"
-        "mov rcx, qword ptr [rcx + 0x80]\n"
-        "jmp qword ptr [rsp - 0x8]\n"
+        // saving rax before clobber
+        "mov qword ptr [r10 + ("CTXOFFSET_RAX" + " SAVEDREGS_OFF ")], rax\n"
+        // r10 contains important state, we use rax as tmp to store it
+        "mov rax, qword ptr [r10 + "ORIGR10_OFF"]\n"
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R10"], rax\n"
+        
+        // *(r10 + offset) = register    where r10 is (char*)(ThreadHijackState*)
+        // rax already saved
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RCX"], rcx\n"
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RDX"], rdx\n"
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RBX"], rbx\n"
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RBP"], rbp\n"
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RSI"], rsi\n"
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RDI"], rdi\n"
+        
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R8"], r8\n"
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R9"], r9\n"
+        // r10 already saved
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R11"], r11\n"
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R12"], r12\n"
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R13"], r13\n"
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R14"], r14\n"
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R15"], r15\n"
+        // rip should already be stored in the ThreadHijackState by C before this was called. We can't read from it here.
+        
+        // save rsp, which is a lil different because we used this function itself is 8 bytes on stack
+        // so 8 bytes back is the "original" sp
+        "lea rax, [rsp + 8]\n" // load up rax with the real "original" sp and then save it off
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RSP"], rax\n"
+        
+        "pushfq\n" // push flags onto stack
+        "pop rax\n" // rax is our "scratch" reg, we pop the flags from stack onto there
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RFLAGS"], rax\n" // pushing RFLAGS onto the CONTEXT's EFlags
+        
+        // restore original rax before returning
+        "mov rax, qword ptr [r10 + "CTXOFFSET_RAX" + " SAVEDREGS_OFF "]\n"
+        "ret\n"
+
         ".att_syntax prefix\n"
     );
 }
+
 
 __attribute__((naked))
 void RipHijackTrampoline(void)
 {
+    // we want to call a C function so we must adhere to Windows x64 ABI
+    // https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention?view=msvc-170
+    // https://learn.microsoft.com/en-us/cpp/build/stack-usage?view=msvc-170
+    // which includes "The stack will always be maintained 16-byte aligned"
+    // Integer arguments are passed in registers RCX, RDX, R8, and R9
+    // https://dev.to/mirrai/x64-windows-assembly-fundamentals-part-1-what-you-actually-need-to-know-6lg
+    // "Before any call the caller must allocate at least 32 bytes (0x20) on the stack even if the function takes fewer than four arguments. This is called the shadow space and it exists so the called function has somewhere to spill its register arguments if it needs to. We also allocate 8 bytes to align the stack because the winapi functions need the stack to be 16 byte aligned or the program crashes"
+    // I've already backed up r10 in g_hijackedThreadState, so that can be scratch reg at the start
     __asm__(
         ".intel_syntax noprefix\n"
-        "lea r11, [rip + g_hijackedThreadState]\n"
-        "call SaveHijackedThreadRegisters\n"
-        "mov r12, r11\n"
-        "mov rcx, r11\n"
-        "lea rdx, [r11 + 0x20]\n"
-        "mov r13, rsp\n"
-        "and rsp, -0x10\n"
-        "sub rsp, 0x20\n"
-        "call OnBasicBlockEnter\n"
-        "mov rsp, r13\n"
-        "mov rcx, r12\n"
-        "call RestoreHijackedThreadRegisters\n"
-        "ud2\n"
+
+        // "rip-relative". We can't just load the 64bit pointer of this global
+        // there's no way to express that in x64, so this lea must be a 32bit address, but our module (and therefore the static)
+        // may be loaded outside the 4GB range a 32bit number could express. So we need to compute a 32bit address of this global
+        // so we use the current instruction pointer (rip) as a base and then offset from that to the global. 
+        "lea rcx, [rip + g_hijackedThreadState]\n"   // param 1 of the function is the state ptr
+        // don't really need to save regs here because we copy the CONTEXT before this func
+        "mov r13, rsp\n" // save stack ptr to nonvolatile reg so we can restore after fn call
+        "and rsp, -0x10\n" // align stack ptr to 16 bytes per win x64 abi
+        "sub rsp, 0x20\n" // alloc 32 bytes of shadow space on stack for win abi
+        "call OnThreadHijack\n"
+        "mov rsp, r13\n" // restore stack ptr
+        "lea r10, [rip + g_hijackedThreadState]\n"  // get state ptr back
+        "call RestoreRegisters\n" // this never returns, it jmps to original rip
+        "ud2\n" // we should never hit this, because RestoreRegisters should jmp to the original thread's Rip
+
         ".att_syntax prefix\n"
     );
 }
-#endif
 
 bool HijackThreadRip(DWORD targetThreadId)
 {
@@ -475,12 +518,12 @@ bool HijackThreadRip(DWORD targetThreadId)
         return false;
     }
 
-    void* originalRip = (void*)(uintptr_t)context.Rip;
     g_hijackedThreadState = (ThreadHijackState){0};
-    g_hijackedThreadState.originalRip = originalRip;
+    // r10 is our "scratch space" before we save off regs, so we back it up here
     g_hijackedThreadState.originalR10 = context.R10;
-    g_hijackedThreadState.originalR11 = context.R11;
-
+    // saving off the thread context so we can restore it after our trampoline
+    g_hijackedThreadState.savedRegs = context;
+    // as soon as the thread resumes, it'll run our hijack asm which eventually calls our C func OnThreadHijack
     context.Rip = (DWORD64)(uintptr_t)RipHijackTrampoline;
 
     if (!SetThreadContext(threadHdl, &context))
@@ -494,7 +537,7 @@ bool HijackThreadRip(DWORD targetThreadId)
     PeonyLogf(
         "Hijacked thread %lu RIP: %p -> %p, threadState=%p\n",
         targetThreadId,
-        originalRip,
+        context.Rip,
         RipHijackTrampoline,
         &g_hijackedThreadState);
 
