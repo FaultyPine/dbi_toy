@@ -16,7 +16,10 @@ set ZydisArgs= -I%EXTERNAL_ROOT%/zydis/dependencies/zycore/include -I%EXTERNAL_R
 if errorlevel 1 goto :fail
 
 "tools/clang/bin/clang.exe" injection.c -o injection.dll -g -shared %ZydisArgs%
+if errorlevel 1 goto :fail
+
 "tools/clang/bin/clang.exe" tester.c -o tester.exe -g -luser32
+if errorlevel 1 goto :fail
 
 echo [build] Success.
 endlocal

@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-set "testerExe=winver.exe"
+set "testerExe=tester.exe"
 for /f "tokens=*" %%A in ('powershell -Command "(Start-Process '%testerExe%' -PassThru).Id"') do set "PID=%%A"
 
 echo Launched test process at PID = %PID%

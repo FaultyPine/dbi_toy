@@ -131,24 +131,6 @@ void PeonyLogf(const char* format, ...)
 }
 
 
-
-__declspec(noinline)
-void OnThreadHijack(ThreadHijackState* state)
-{
-    // TODO: look at PC of this thread
-    // if we have this basic block in the code cache, jump there i think?
-    // else...
-    // go from that PC to end of next basic block.
-    // disassemble ^ that range
-    // allocate destination machine code in code cache so we have a known address of the code
-    // transform disassembly with any desired instrumentation
-    // re-encode transformed disasm to machine code
-    // copy to destination code cache block
-    // patch original code to jump to our code cache block
-    // make sure our code cache block jumps back to original code
-    PeonyLogf("We have hijacked the thread!\n");
-}
-
 BOOL WINAPI DllMain(
     HINSTANCE hinstDLL,
     DWORD fdwReason,
@@ -276,7 +258,7 @@ ThreadInfo* ListProcessThreads(DWORD targetPid)
                         {
                             strcpy_s(ti.threadName, sizeof(ti.threadName), "[Name Conversion Failed]");
                         }
-                    } 
+                    }
                     if (threadName) 
                     {
                         LocalFree(threadName);
@@ -300,6 +282,116 @@ bool ShouldWeCareAboutThisModule(SharedCommsObject* sharedComms, const ModuleInf
     // TODO: filtering
     return true;
 }
+
+// pseudo
+// void* LookupOrCompile(uint64_t app_pc) 
+// {
+//     if (cache[app_pc])
+//         return cache[app_pc];
+
+//     return CompileBasicBlock(app_pc);
+// }
+
+static bool IsBasicBlockTerminator(const ZydisDecodedInstruction* instr)
+{
+    switch (instr->meta.category)
+    {
+        case ZYDIS_CATEGORY_COND_BR:
+        case ZYDIS_CATEGORY_UNCOND_BR:
+        case ZYDIS_CATEGORY_CALL:
+        case ZYDIS_CATEGORY_RET:
+        case ZYDIS_CATEGORY_INTERRUPT:
+        case ZYDIS_CATEGORY_SYSCALL:
+        case ZYDIS_CATEGORY_SYSRET:
+            return true;
+
+        default:
+            break;
+    }
+
+    switch (instr->mnemonic)
+    {
+        case ZYDIS_MNEMONIC_IRET:
+        case ZYDIS_MNEMONIC_IRETD:
+        case ZYDIS_MNEMONIC_IRETQ:
+        case ZYDIS_MNEMONIC_UIRET:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+__declspec(noinline)
+void OnThreadHijack(ThreadHijackState* state)
+{
+    // TODO: look at PC of this thread
+    // if we have this basic block in the code cache, jump there i think?
+    // else...
+    // go from that PC to end of next basic block.
+    // disassemble ^ that range
+    // allocate destination machine code in code cache so we have a known address of the code
+    // transform disassembly with any desired instrumentation
+    // re-encode transformed disasm to machine code
+    // copy to destination code cache block
+    // patch original code to jump to our code cache block
+    // make sure our code cache block jumps back to original code
+    PeonyLogf("We have hijacked the thread!\n");
+    /*
+    OnThreadHijack reads state->savedRegs.Rip.
+    Decode one basic block with Zydis.
+    Emit instrumented relocated code into executable memory.
+    Emit block exits that call/jump through LookupOrCompile.
+    Set state->savedRegs.Rip = code_cache_entry.
+    Let RestoreRegisters jump there.
+    */
+    uint64_t originalRip = state->savedRegs.Rip;
+    uint64_t currentPC = originalRip;
+
+    ZydisDecoder decoder;
+    if (ZYAN_FAILED(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)))
+    {
+        PeonyLogf("Failed to init zydis decoder\n");
+        return;
+    }
+
+    ZydisFormatter fmt;
+    if (ZYAN_FAILED(ZydisFormatterInit(&fmt, ZYDIS_FORMATTER_STYLE_INTEL)))
+    {
+        PeonyLogf("Failed to init zydis formatter\n");
+        return;
+    }
+
+    char fmt_buf[256];
+    for (;;)
+    {
+        ZydisDecodedInstruction instr;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        ZyanStatus status = ZydisDecoderDecodeFull(&decoder, (void*)currentPC, ZYDIS_MAX_INSTRUCTION_LENGTH, &instr, operands);
+        if (ZYAN_FAILED(status))
+        {
+            PeonyLogf("Failed to decode instruction: %lu", status);
+            break;
+        }
+        currentPC += instr.length;
+
+        // Format & print the original instruction.
+        if (ZYAN_FAILED(ZydisFormatterFormatInstruction(&fmt, &instr, operands,
+            instr.operand_count_visible, fmt_buf, sizeof(fmt_buf), 0, NULL)))
+        {
+            PeonyLogf("Zydis failed to format instruction\n");
+            break;   
+        }
+        PeonyLogf("Original instruction: %s\n", fmt_buf);
+
+        if (IsBasicBlockTerminator(&instr))
+        {
+            break;
+        }
+    }
+
+}
+
 
 _Static_assert(offsetof(CONTEXT, EFlags) == 68, "CONTEXT offset wrong");
 #define CTXOFFSET_RFLAGS STRINGIFY(68)
@@ -518,6 +610,7 @@ bool HijackThreadRip(DWORD targetThreadId)
         return false;
     }
 
+    DWORD64 originalRip = context.Rip;
     g_hijackedThreadState = (ThreadHijackState){0};
     // r10 is our "scratch space" before we save off regs, so we back it up here
     g_hijackedThreadState.originalR10 = context.R10;
@@ -537,7 +630,7 @@ bool HijackThreadRip(DWORD targetThreadId)
     PeonyLogf(
         "Hijacked thread %lu RIP: %p -> %p, threadState=%p\n",
         targetThreadId,
-        context.Rip,
+        originalRip,
         RipHijackTrampoline,
         &g_hijackedThreadState);
 
@@ -552,7 +645,7 @@ bool HijackThreadRip(DWORD targetThreadId)
 #endif
 }
 
-#define DEBUG_PICK_THREAD_WITH_NAME "main"
+#define DEBUG_PICK_THREAD_CONTAINS_NAME "main"
 
 void Initialize()
 {
@@ -566,7 +659,7 @@ void Initialize()
 
     ModuleInfo* moduleInfos = ListProcessModules(pid);
     PeonyLogf("Target thread id from shared comms: %lu", sharedComms->targetThreadId);
-#ifdef DEBUG_PICK_THREAD_WITH_NAME
+#ifdef DEBUG_PICK_THREAD_CONTAINS_NAME
     if (sharedComms->targetThreadId == 0)
     {
         // pick a thread matching the hardcoded name for debugging/testing
@@ -574,21 +667,23 @@ void Initialize()
         for (int i = 0; i < arrlen(threadInfos); i++)
         {
             ThreadInfo* threadInfo = &threadInfos[i];
-            if (strncmp(threadInfo->threadName, DEBUG_PICK_THREAD_WITH_NAME, THREAD_NAME_MAX_LEN) == 0)
+            if (strstr(threadInfo->threadName, DEBUG_PICK_THREAD_CONTAINS_NAME))
             {
+                PeonyLogf("Found thread with name %s threadid %lu\n", threadInfo->threadName, threadInfo->threadId);
                 sharedComms->targetThreadId = threadInfo->threadId;
             }
         }
         if (sharedComms->targetThreadId == 0)
         {
-            PeonyLogf("Failed to find a thread in the target process with name: %s", DEBUG_PICK_THREAD_WITH_NAME);
+            PeonyLogf("Failed to find a thread in the target process with name: %s", DEBUG_PICK_THREAD_CONTAINS_NAME);
             for (int i = 0; i < arrlen(threadInfos); i++)
             {
                 ThreadInfo* threadInfo = &threadInfos[i];
                 PeonyLogf("Thread %lu | %s", threadInfo->threadId, threadInfo->threadName);
             }
-            PeonyLogf("Picking the first thread: %lu", threadInfos[0].threadId);
-            sharedComms->targetThreadId = threadInfos[0].threadId;
+            DWORD pickedThreadId = threadInfos[0].threadId;
+            PeonyLogf("Picking the first thread: %lu", pickedThreadId);
+            sharedComms->targetThreadId = pickedThreadId;
         }
         arrfree(threadInfos);
     }

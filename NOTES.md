@@ -22,3 +22,9 @@ volatile regs: regs that may change after a function call
 non-volatile regs: regs that the callee makes sure are preserved across fn calls
 Volatile (Caller-saved): RAX, RCX, RDX, R8, R9, R10, R11, and XMM0–XMM5
 Non-volatile (Callee-saved): RBX, RBP, RDI, RSI, RSP, R12, R13, R14, R15, and XMM6–XMM15
+
+
+
+https://github.com/zyantific/zydis/blob/master/examples/RewriteCode.c - how to decode, change, reencode instructions
+https://github.com/zyantific/zydis/blob/master/examples/EncodeFromScratch.c  - very small easy to read "jit" code execution
+zydis points out in their readme that this is a nice zydis wrapper (but uses c++) https://github.com/zyantific/zasm/tree/master
