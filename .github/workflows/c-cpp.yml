@@ -13,8 +13,8 @@ jobs:
 
     steps:
      - uses: actions/checkout@v4
-     - name: checkout 
-       run: git submodule update --init --recursive
+       with:
+         submodules: recursive
      - name: build
        run: ./build.bat
        shell: cmd
