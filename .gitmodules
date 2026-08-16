@@ -1,3 +1,6 @@
 [submodule "external/LuaJIT"]
 	path = external/LuaJIT
 	url = https://github.com/LuaJIT/LuaJIT
+[submodule "external/zydis"]
+	path = external/zydis
+	url = https://github.com/zyantific/zydis.git
