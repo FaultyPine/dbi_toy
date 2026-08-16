@@ -1,4 +1,5 @@
 *.exe
+!tools/**/*.exe
 *.d
 *.dll
 *.pdb
