@@ -66,7 +66,13 @@ typedef struct
 
 static CodeCache g_codeCache;
 
+typedef struct
+{
+    uint8_t* cursor;
+} CodeCursor;
+
 #define DBI_CODE_CACHE_SIZE (1024 * 1024)
+#define DBI_LOG_BASIC_BLOCK_COMPILE 0
 
 // Stay in signed rel32 +/- 2 GB range when searching for nearby code-cache memory
 static const uintptr_t DBI_CODE_CACHE_NEAR_SEARCH_RADIUS = 0x70000000ULL;
@@ -443,26 +449,56 @@ bool CodeCacheInit(uintptr_t nearPc)
     return true;
 }
 
+uint8_t* CodeCacheReserve(size_t bytes)
+{
+    if (g_codeCache.used + bytes > g_codeCache.capacity)
+    {
+        PeonyLogf("Code cache is full!\n");
+        return NULL;
+    }
+    uint8_t* result = g_codeCache.base + g_codeCache.used;
+    g_codeCache.used += bytes;
+    return result;
+}
+
+
+void OnCompileBasicBlock(CodeCursor* pOut)
+{
+    
+}
+
+// TODO: look at PC of this thread
+// if we have this basic block in the code cache, jump there i think?
+// else...
+// go from that PC to end of next basic block.
+// disassemble ^ that range
+// allocate destination machine code in code cache so we have a known address of the code
+// transform disassembly with any desired instrumentation
+// re-encode transformed disasm to machine code
+// Emit block exits that call/jump through LookupOrCompile.
+// Emit instrumented relocated code into executable memory.
+// copy to destination code cache block
 uint8_t* DbiLookupOrCompile(uintptr_t appPc)
 {
-    // TODO: look at PC of this thread
-    // if we have this basic block in the code cache, jump there i think?
-    // else...
-    // go from that PC to end of next basic block.
-    // disassemble ^ that range
-    // allocate destination machine code in code cache so we have a known address of the code
-    // transform disassembly with any desired instrumentation
-    // re-encode transformed disasm to machine code
-    // Emit block exits that call/jump through LookupOrCompile.
-    // Emit instrumented relocated code into executable memory.
-    // copy to destination code cache block
+    uint8_t* existingCodeCacheEntryForThisPc = CodeCacheLookup(appPc);
+    if (existingCodeCacheEntryForThisPc)
+    {
+        return existingCodeCacheEntryForThisPc;
+    }
+
+    // we didn't find an entry in the code cache for this pc, we need to compile this basic block
 
     if (!CodeCacheInit(appPc))
     {
         return (uint8_t*)appPc;
     }
 
-    uint64_t currentPC = appPc;
+    size_t reserveSize = 4096;
+    uint8_t* blockStart = CodeCacheReserve(reserveSize);
+    if (!blockStart)
+    {
+        return (uint8_t*)appPc;
+    }
 
     ZydisDecoder decoder;
     if (ZYAN_FAILED(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)))
@@ -478,9 +514,21 @@ uint8_t* DbiLookupOrCompile(uintptr_t appPc)
         return (uint8_t*)appPc;
     }
 
+    uint64_t currentPC = appPc;
+    // code emitting "cursor". this points to the code cache we need to write the jitted instructions to
+    CodeCursor codeOut = {.cursor = blockStart}; 
+
+#if DBI_LOG_BASIC_BLOCK_COMPILE
+    PeonyLogf("Compiling basic block at %p -> %p", (void*)appPc, blockStart);
+#endif
+
+    OnCompileBasicBlock(&codeOut);
+
     char fmt_buf[256];
     for (;;)
     {
+        // decode/process single instructions until we hit a control flow instr that ends this "basic block"
+
         ZydisDecodedInstruction instr;
         ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
         ZyanStatus status = ZydisDecoderDecodeFull(&decoder, (void*)currentPC, ZYDIS_MAX_INSTRUCTION_LENGTH, &instr, operands);

@@ -1,4 +1,9 @@
 
+
+// This is the main runner program for this DBI engine
+// you can point it at a process/thread id and it'll call injection.c to instrument the process/thread
+// this program also handles some communication with the remote process - like pumping logs and coordinating other params
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <windows.h>
@@ -15,39 +20,6 @@
 // then this main process can pump those logs to it's own stdout 
 // so we can essentially log from the external injected process
 #define PEONY_PUMP_INJECTED_LOGS 1
-
-/*
-
-pseudocode:
-
-void* CompileBasicBlock(uintptr_t pc)
-{
-    BasicBlock bb = DecodeUntilControlTransfer(pc); 
-
-    uint8_t* output = codeCache.allocate(EstimateSize(bb));
-
-    EmitInstrumentation(output, bb);
-
-    for (auto& instruction : bb.instructions)
-        RelocateAndEmit(output, instruction);
-
-    EmitExitStub(output, bb);
-
-    blockMap[pc] = output;
-
-    return output;
-}
-
-
-production instrumentation engines analyze the code to see which regs/flags are "live" and only save/restore those
-in instrumented live code.
-but we will do a dumber slower thing for simplicity (just save everything?).
-
-https://dynamorio.org/overview.html?utm_source=chatgpt.com
-https://frida.re/docs/stalker/?utm_source=chatgpt.com
-https://medium.com/@oleavr/anatomy-of-a-code-tracer-b081aadb0df8
-
-*/
 
 typedef struct 
 {
@@ -291,7 +263,7 @@ int main(int argc, char** argv)
     const char* injectionDllFile = "injection.dll";
     RemoteProcInfo remoteProcInfo = InjectCodeIntoProcess(g_state.pid, injectionDllFile);
 
-    printf("Main injector process waiting around with nothing to do now...\n");
+    printf("Main injector process waiting...\n");
     WaitForSingleObject(remoteProcInfo.remoteProcHdl, INFINITE);
 
     printf("Main injector process: Peace Out.\n");
