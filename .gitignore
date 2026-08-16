@@ -3,5 +3,8 @@
 *.dll
 *.pdb
 *.ilk
+build/
 external/Dynamorio-Windows-*
 external/zydis/build
+.vscode
+.vs

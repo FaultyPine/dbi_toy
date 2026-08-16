@@ -5,10 +5,19 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <windows.h>
 #include <TlHelp32.h>
 #include "Zydis.h"
+
+#define DASM_FDEF static
+#include "dasm_proto.h"
+#include "dasm_x86.h"
+
+|.arch x64
+|.actionlist peony_dynasm_actions
+|.section code
 
 #define STB_DS_IMPLEMENTATION
 #include "external/std_ds.h"

@@ -6,6 +6,7 @@
 #include "Zydis.h"
 
 // x64 emitter helper
+// NOTE: this is unused currently, in favor of using DynAsm
 
 // https://www.felixcloutier.com/x86/
 // https://wiki.osdev.org/X86-64_Instruction_Encoding
