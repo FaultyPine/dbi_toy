@@ -28,3 +28,6 @@ Non-volatile (Callee-saved): RBX, RBP, RDI, RSI, RSP, R12, R13, R14, R15, and XM
 https://github.com/zyantific/zydis/blob/master/examples/RewriteCode.c - how to decode, change, reencode instructions
 https://github.com/zyantific/zydis/blob/master/examples/EncodeFromScratch.c  - very small easy to read "jit" code execution
 zydis points out in their readme that this is a nice zydis wrapper (but uses c++) https://github.com/zyantific/zasm/tree/master
+
+I should use this!  https://github.com/LuaJIT/LuaJIT/tree/v2.1/dynasm
+                really clever C machine code emitter where you can kinda put emit inline assembly directly inside C
