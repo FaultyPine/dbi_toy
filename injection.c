@@ -50,6 +50,39 @@ _Static_assert(offsetof(ThreadHijackState, savedRegs) == SAVEDREGS_OFF_NUM, "une
 static ThreadHijackState g_hijackedThreadState;
 static SharedLogObject* g_sharedLog;
 
+typedef struct
+{
+    uintptr_t appPc;
+    uint8_t* cachePc;
+} CodeCacheEntry;
+
+typedef struct
+{
+    uint8_t* base;
+    size_t capacity;
+    size_t used;
+    CodeCacheEntry* entries; // arr
+} CodeCache;
+
+static CodeCache g_codeCache;
+
+#define DBI_CODE_CACHE_SIZE (1024 * 1024)
+
+// Stay in signed rel32 +/- 2 GB range when searching for nearby code-cache memory
+static const uintptr_t DBI_CODE_CACHE_NEAR_SEARCH_RADIUS = 0x70000000ULL;
+
+static uintptr_t AlignDownToPowerOfTwo(uintptr_t value, uintptr_t alignment)
+{
+    return value & ~(alignment - 1);
+}
+
+// "fromNextRip" because x64 relative instructions are calculated from the next instruction after the relative one, not from the instruction start
+static bool IsRel32Reachable(uintptr_t fromNextRip, uintptr_t target)
+{
+    int64_t delta = (int64_t)(target - fromNextRip);
+    return delta >= INT32_MIN && delta <= INT32_MAX;
+}
+
 void PeonyLogWrite(const char* bytes, int length)
 {
     if (length <= 0)
@@ -331,8 +364,86 @@ static bool IsBasicBlockTerminator(const ZydisDecodedInstruction* instr)
     }
 }
 
-__declspec(noinline)
-void OnThreadHijack(ThreadHijackState* state)
+uint8_t* CodeCacheLookup(uint64_t appPc)
+{
+    for (int i = 0; i < arrlen(g_codeCache.entries); i++)
+    {
+        CodeCacheEntry* entry = &g_codeCache.entries[i];
+        if (entry->appPc == appPc)
+        {
+            return entry->cachePc;
+        }
+    }
+    return NULL;
+}
+
+// tries to initialize code cache memory within rel32 range of 'nearPc'
+// if we can get our code cache within rel32 range, we can relocate rip-relative stuff much easier/more consistently
+// if we can't get it nearby, we still initialize, but some rip-relative stuff might be more complicated to properly jit
+// and for this project idk if i'll even bother with that situation
+bool CodeCacheInit(uintptr_t nearPc)
+{
+    if (g_codeCache.base)
+    {
+        return true;
+    }
+    
+    // here we start at nearPc and fan out in both directions
+    // up and down in memory (+ and -)
+    // trying to find a contiguous DBI_CODE_CACHE_SIZE block of available memory we can allocate for our code cache
+
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    uintptr_t granularity = sysInfo.dwAllocationGranularity;
+    uintptr_t anchor = AlignDownToPowerOfTwo(nearPc, granularity);
+
+    for (uintptr_t distance = 0; distance < DBI_CODE_CACHE_NEAR_SEARCH_RADIUS; distance += granularity)
+    {
+        uintptr_t candidates[2] = {anchor + distance, anchor - distance};
+        for (int i = 0; i < 2; i++)
+        {
+            if (candidates[i] < granularity)
+            {
+                continue;
+            }
+
+            uint8_t* memory = (uint8_t*)VirtualAlloc(
+                (void*)candidates[i],
+                DBI_CODE_CACHE_SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_EXECUTE_READWRITE);
+            if (memory && IsRel32Reachable((uintptr_t)memory, nearPc))
+            {
+                g_codeCache.base = memory;
+                g_codeCache.capacity = DBI_CODE_CACHE_SIZE;
+                g_codeCache.used = 0;
+                PeonyLogf("Code cache allocated at %p near %p", memory, (void*)nearPc);
+                return true;
+            }
+            if (memory)
+            {
+                VirtualFree(memory, 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    g_codeCache.base = (uint8_t*)VirtualAlloc(
+        NULL,
+        DBI_CODE_CACHE_SIZE,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_EXECUTE_READWRITE);
+    if (!g_codeCache.base)
+    {
+        PeonyLogf("Failed to allocate code cache: %lu", GetLastError());
+        return false;
+    }
+    g_codeCache.capacity = DBI_CODE_CACHE_SIZE;
+    g_codeCache.used = 0;
+    PeonyLogf("Code cache allocated at %p, but not necessarily near %p", g_codeCache.base, (void*)nearPc);
+    return true;
+}
+
+uint8_t* DbiLookupOrCompile(uintptr_t appPc)
 {
     // TODO: look at PC of this thread
     // if we have this basic block in the code cache, jump there i think?
@@ -342,33 +453,29 @@ void OnThreadHijack(ThreadHijackState* state)
     // allocate destination machine code in code cache so we have a known address of the code
     // transform disassembly with any desired instrumentation
     // re-encode transformed disasm to machine code
+    // Emit block exits that call/jump through LookupOrCompile.
+    // Emit instrumented relocated code into executable memory.
     // copy to destination code cache block
-    // patch original code to jump to our code cache block
-    // make sure our code cache block jumps back to original code
-    PeonyLogf("We have hijacked the thread!\n");
-    /*
-    OnThreadHijack reads state->savedRegs.Rip.
-    Decode one basic block with Zydis.
-    Emit instrumented relocated code into executable memory.
-    Emit block exits that call/jump through LookupOrCompile.
-    Set state->savedRegs.Rip = code_cache_entry.
-    Let RestoreRegisters jump there.
-    */
-    uint64_t originalRip = state->savedRegs.Rip;
-    uint64_t currentPC = originalRip;
+
+    if (!CodeCacheInit(appPc))
+    {
+        return (uint8_t*)appPc;
+    }
+
+    uint64_t currentPC = appPc;
 
     ZydisDecoder decoder;
     if (ZYAN_FAILED(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)))
     {
         PeonyLogf("Failed to init zydis decoder\n");
-        return;
+        return (uint8_t*)appPc;
     }
 
     ZydisFormatter fmt;
     if (ZYAN_FAILED(ZydisFormatterInit(&fmt, ZYDIS_FORMATTER_STYLE_INTEL)))
     {
         PeonyLogf("Failed to init zydis formatter\n");
-        return;
+        return (uint8_t*)appPc;
     }
 
     char fmt_buf[256];
@@ -384,7 +491,6 @@ void OnThreadHijack(ThreadHijackState* state)
         }
         currentPC += instr.length;
 
-        // Format & print the original instruction.
         if (ZYAN_FAILED(ZydisFormatterFormatInstruction(&fmt, &instr, operands,
             instr.operand_count_visible, fmt_buf, sizeof(fmt_buf), 0, NULL)))
         {
@@ -398,7 +504,17 @@ void OnThreadHijack(ThreadHijackState* state)
             break;
         }
     }
+    // TODO: return code cache pc
+    return (uint8_t*)appPc;
+}
 
+__declspec(noinline)
+void OnThreadHijack(ThreadHijackState* state)
+{
+   uint64_t originalRip = state->savedRegs.Rip;
+   uint8_t* codeCacheRip = DbiLookupOrCompile(originalRip);
+   state->savedRegs.Rip = (DWORD64)codeCacheRip;
+   PeonyLogf("We have hijacked the thread into the code cache rip %p -> %p\n", originalRip, codeCacheRip);
 }
 
 
