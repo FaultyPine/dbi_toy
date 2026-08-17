@@ -480,6 +480,7 @@ bool HasRipRelativeMemoryOp(ZydisDecodedInstruction* instr, ZydisDecodedOperand*
 
 bool EmitRelocatedInstruction(CodeCursor* cursor, uintptr_t appPc, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands)
 {
+    // if it's not a rip-relative instruction, we can just emit the original one exactly as it was
     bool isRipRelativeMemoryOperand = HasRipRelativeMemoryOp(instr, operands);
     if (!isRipRelativeMemoryOperand)
     {
@@ -510,8 +511,7 @@ bool EmitRelocatedInstruction(CodeCursor* cursor, uintptr_t appPc, ZydisDecodedI
     for (int i = 0; i < instr->operand_count_visible; i++)
     {
         ZydisDecodedOperand* operand = &operands[i];
-        bool isOperandRipRelativeMemoryOp = operand->type == ZYDIS_OPERAND_TYPE_MEMORY && (operand->mem.base == ZYDIS_REGISTER_RIP || operand->mem.base == ZYDIS_REGISTER_EIP);
-        if (!isOperandRipRelativeMemoryOp)
+        if (!IsRipRelativeMemoryOp(operand))
         {
             continue;
         }
@@ -524,7 +524,7 @@ bool EmitRelocatedInstruction(CodeCursor* cursor, uintptr_t appPc, ZydisDecodedI
         #endif
 
         ZyanU64 absoluteTarget = 0;
-        if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[i], appPc, &absoluteTarget)))
+        if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, operand, appPc, &absoluteTarget)))
         {
             PeonyLogf("Failed to resolve RIP-relative target at %p", (void*)appPc);
             return false;
@@ -580,36 +580,37 @@ uint8_t* DbiLookupOrCompile(uintptr_t appPc)
     }
 
     // we didn't find an entry in the code cache for this pc, we need to compile this basic block
-
-    if (!CodeCacheInit(appPc))
-    {
-        return (uint8_t*)appPc;
-    }
-
+    
     dasm_State* D = NULL;
     dasm_State** Dst = &D;
     dasm_init(Dst, DASM_MAXSECTION);
+    //dasm_setupglobal(Dst, ) // ?
     dasm_setup(Dst, peony_dynasm_actions);
+    
+    if (!CodeCacheInit(appPc))
+    {
+        goto error;
+    }
 
     size_t reserveSize = 4096;
     uint8_t* blockStart = CodeCacheReserve(reserveSize);
     if (!blockStart)
     {
-        return (uint8_t*)appPc;
+        goto error;
     }
 
     ZydisDecoder decoder;
     if (ZYAN_FAILED(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)))
     {
         PeonyLogf("Failed to init zydis decoder\n");
-        return (uint8_t*)appPc;
+        goto error;
     }
 
     ZydisFormatter fmt;
     if (ZYAN_FAILED(ZydisFormatterInit(&fmt, ZYDIS_FORMATTER_STYLE_INTEL)))
     {
         PeonyLogf("Failed to init zydis formatter\n");
-        return (uint8_t*)appPc;
+        goto error;
     }
 
     uint64_t currentPC = appPc;
@@ -633,15 +634,15 @@ uint8_t* DbiLookupOrCompile(uintptr_t appPc)
         if (ZYAN_FAILED(status))
         {
             PeonyLogf("Failed to decode instruction at %p: %lu", (void*)currentPC, status);
-            break;
+            goto error;
         }
         
 #if DBI_LOG_COMPILATION_VERBOSE
         if (ZYAN_FAILED(ZydisFormatterFormatInstruction(&fmt, &instr, operands,
-            instr.operand_count_visible, fmt_buf, sizeof(fmt_buf), 0, NULL)))
+                        instr.operand_count_visible, fmt_buf, sizeof(fmt_buf), 0, NULL)))
         {
             PeonyLogf("Zydis failed to format instruction\n");
-            break;   
+            goto error; 
         }
         PeonyLogf("Original instruction: %s\n", fmt_buf);
 #endif
@@ -657,7 +658,7 @@ uint8_t* DbiLookupOrCompile(uintptr_t appPc)
         if (!EmitRelocatedInstruction(&codeOut, currentPC, &instr, operands))
         {
             PeonyLogf("failed to relocate instruction at %p\n", (void*)currentPC);
-            return (uint8_t*)appPc;
+            goto error;
         }
         currentPC += instr.length;
     }
@@ -673,6 +674,11 @@ uint8_t* DbiLookupOrCompile(uintptr_t appPc)
 
     // return the code cache, so now the program will be executing in our instrumented code
     return (uint8_t*)blockStart;
+
+error:
+    dasm_free(Dst);
+    return (uint8_t*)appPc;
+
 }
 
 __declspec(noinline)

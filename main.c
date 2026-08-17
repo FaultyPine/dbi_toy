@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <windows.h>
+#include <tlhelp32.h>
 #include <string.h>
 
 #include "shared_defines.h"
@@ -25,6 +26,7 @@ typedef struct
 {
     int pid;
     DWORD targetThreadId;
+    char exeName[MAX_PATH];
 } GlobalState;
 
 GlobalState g_state;
@@ -105,6 +107,7 @@ DWORD WINAPI InjectedLogPumpThread(LPVOID param)
 // =========== CMDLINE ARG PARSING ===============
 #define DECLARE_CMDLINE_ARGS \
     X(pid, ParsePid) \
+    X(exeName, ParseExeName) \
     X(targetThreadId, ParseTargetThreadId)
 
 typedef enum
@@ -133,6 +136,11 @@ void ParsePid(const char* content)
     g_state.pid = atoi(content);
 }
 
+void ParseExeName(const char* content)
+{
+    strncpy_s(g_state.exeName, sizeof(g_state.exeName), content, MAX_PATH);
+}
+
 void ParseTargetThreadId(const char* content)
 {
     g_state.targetThreadId = (DWORD)strtoul(content, NULL, 10);
@@ -155,16 +163,59 @@ typedef struct
     void* remoteMem;
 } RemoteProcInfo;
 
+DWORD FindPidByExeName(const char* exeName)
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+    {
+        printf("CreateToolhelp32Snapshot failed: %lu\n", GetLastError());
+        return 0;
+    }
+
+    PROCESSENTRY32 entry = {0};
+    entry.dwSize = sizeof(entry);
+
+    DWORD pid = 0;
+    if (Process32First(snapshot, &entry))
+    {
+        do
+        {
+            if (_strnicmp(exeName, entry.szExeFile, MAX_PATH) == 0)
+            {
+                pid = entry.th32ProcessID;
+                break;
+            }
+        } while (Process32Next(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return pid;
+}
+
+DWORD WaitForPidByExeName(const char* exeName)
+{
+    printf("Waiting for executable \"%s\"...\n", exeName);
+    for (;;)
+    {
+        DWORD pid = FindPidByExeName(exeName);
+        if (pid != 0)
+        {
+            return pid;
+        }
+        Sleep(1000);
+    }
+}
+
 RemoteProcInfo InjectCodeIntoProcess(int pid, const char* sharedLibPath)
 {
     RemoteProcInfo remoteProcInfo = {0};
     HANDLE remoteProc = OpenProcess(
         PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | SYNCHRONIZE,
         FALSE,
-        g_state.pid);
+        pid);
     if (remoteProc == NULL)
     {
-        printf("OpenProcess failed %lu. Does PID %i exist?\n", GetLastError(), g_state.pid);
+        printf("OpenProcess failed %lu. Does PID %i exist?\n", GetLastError(), pid);
         return remoteProcInfo;
     }
 
@@ -212,6 +263,7 @@ RemoteProcInfo InjectCodeIntoProcess(int pid, const char* sharedLibPath)
 int main(int argc, char** argv)
 {
     memset(&g_state, 0, sizeof(g_state));
+    int exitCode = 0;
 
     int cmdlineArgsMask = 0;
     for (int i = 0; i < argc; i++)
@@ -228,6 +280,11 @@ int main(int argc, char** argv)
                 break;
             }
         }
+    }
+
+    if (g_state.pid == 0 && g_state.exeName[0] != '\0')
+    {
+        g_state.pid = (int)WaitForPidByExeName(g_state.exeName);
     }
 
     if (g_state.pid == 0)
@@ -262,12 +319,19 @@ int main(int argc, char** argv)
 
     const char* injectionDllFile = "injection.dll";
     RemoteProcInfo remoteProcInfo = InjectCodeIntoProcess(g_state.pid, injectionDllFile);
+    if (!remoteProcInfo.remoteProcHdl)
+    {
+        printf("Main injector process: attach failed.\n");
+        exitCode = 1;
+        goto cleanup;
+    }
 
     printf("Main injector process waiting...\n");
     WaitForSingleObject(remoteProcInfo.remoteProcHdl, INFINITE);
 
     printf("Main injector process: Peace Out.\n");
 
+cleanup:
     if (g_logPumpState.stopEvent)
     {
         SetEvent(g_logPumpState.stopEvent);
@@ -284,9 +348,18 @@ int main(int argc, char** argv)
         CloseHandle(g_logPumpState.stopEvent);
     }
 
-    CloseHandle(remoteProcInfo.remoteThreadHdl);
-    VirtualFreeEx(remoteProcInfo.remoteProcHdl, remoteProcInfo.remoteMem, 0, MEM_RELEASE);
-    CloseHandle(remoteProcInfo.remoteProcHdl);
+    if (remoteProcInfo.remoteThreadHdl)
+    {
+        CloseHandle(remoteProcInfo.remoteThreadHdl);
+    }
+    if (remoteProcInfo.remoteMem)
+    {
+        VirtualFreeEx(remoteProcInfo.remoteProcHdl, remoteProcInfo.remoteMem, 0, MEM_RELEASE);
+    }
+    if (remoteProcInfo.remoteProcHdl)
+    {
+        CloseHandle(remoteProcInfo.remoteProcHdl);
+    }
 
-    return 0;
+    return exitCode;
 }

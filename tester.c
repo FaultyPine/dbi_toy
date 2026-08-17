@@ -75,6 +75,10 @@ int main(int argc, char** argv)
     fflush(stdout);
 
     g_dbiSink = DbiHotLoop(0x123456789ABCDEF0ULL);
-    printf("tester done sink=%llu\n", (unsigned long long)g_dbiSink);
+    unsigned long long expected = 16815769637575916324LLU;
+    printf("tester done (success=%i) sink=%llu  expected=%llu\n", 
+            (unsigned long long)g_dbiSink == expected, (unsigned long long)g_dbiSink, expected);
+    printf("Press Enter to continue...\n");
+    getchar(); 
     return 0;
 }
