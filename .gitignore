@@ -9,3 +9,4 @@ external/Dynamorio-Windows-*
 external/zydis/build
 .vscode
 .vs
+*.rdi

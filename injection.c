@@ -478,12 +478,15 @@ bool HasRipRelativeMemoryOp(ZydisDecodedInstruction* instr, ZydisDecodedOperand*
     return false;
 }
 
-bool EmitRelocatedInstruction(CodeCursor* cursor, uintptr_t appPc, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands)
+bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, uintptr_t appPc, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands)
 {
     // if it's not a rip-relative instruction, we can just emit the original one exactly as it was
     bool isRipRelativeMemoryOperand = HasRipRelativeMemoryOp(instr, operands);
     if (!isRipRelativeMemoryOperand)
     {
+        #if DBI_LOG_COMPILATION_VERBOSE
+        PeonyLogf("Not rip-relative, emitting original instruction.\n");
+        #endif
         return X64EmitBytes(&cursor->cursor, (void*)appPc, instr->length);
     }
 
@@ -651,13 +654,14 @@ uint8_t* DbiLookupOrCompile(uintptr_t appPc)
         {
             // TODO: handle emitting terminators for all the different control flow operations
             // like call, ret, uncond branch, cond branch, syscall/sysret
+            assert(false && "Haven't implemented terminators yet");
             currentPC += instr.length;
             break;
         }
 
-        if (!EmitRelocatedInstruction(&codeOut, currentPC, &instr, operands))
+        if (!EmitAndPossiblyRelocateInstruction(&codeOut, currentPC, &instr, operands))
         {
-            PeonyLogf("failed to relocate instruction at %p\n", (void*)currentPC);
+            PeonyLogf("failed to emit/relocate instruction at %p\n", (void*)currentPC);
             goto error;
         }
         currentPC += instr.length;
