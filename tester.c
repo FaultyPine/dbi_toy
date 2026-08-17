@@ -1,9 +1,11 @@
 
 
+#include <stdint.h>
 #include <stdio.h>
 #include <windows.h>
 
-int numTimes = 500;
+// to ensure the dbihotlook isn't optimized out
+volatile uint64_t g_dbiSink;
 
 
 const DWORD MS_VC_EXCEPTION = 0x406D1388;
@@ -47,41 +49,32 @@ void ThreadSetName(const char* threadName)
     #endif
 }
 
-DWORD somefunction(void* userdata)
+__declspec(noinline)
+uint64_t DbiHotLoop(uint64_t seed)
 {
-    ThreadSetName("somefunction");
-    printf("Testing! threadid = %lu\n", GetThreadId(GetCurrentThread()));
-    int something = 5;
-    while (numTimes--)
+    uint64_t x = seed;
+    for (uint64_t i = 0; i < 500000000ULL; i++)
     {
-        while (something % 2 != 0)
+        x += (i ^ 0x9E3779B97F4A7C15ULL);
+        if ((x & 7) == 3)
         {
-            something++;
-            if (something % 3 == 0)
-            {
-                printf("Aaaaa eeeee oooooo\n");
-            }
+            x = (x << 9) ^ (x >> 5) ^ i;
+        }
+        else
+        {
+            x = (x * 33) + (i | 1);
         }
     }
-    return 0;
+    return x;
 }
 
 int main(int argc, char** argv)
 {
     ThreadSetName("main");
-    //MessageBox(0, TEXT("Tester here"), TEXT("yupp"), MB_OKCANCEL | MB_ICONQUESTION);
-    printf("tester here\n");
-    HANDLE otherThreadHdl = CreateThread(0, 0, &somefunction, 0, 0, 0);
-    int x = 0;
-    for (;;)
-    {
-        x++;
-        if (x == 100)
-        {
-            break;
-        }
-        Sleep(1);
-    }
-    WaitForSingleObject(otherThreadHdl, INFINITE);
+    printf("tester pid=%lu main_tid=%lu\n", GetCurrentProcessId(), GetCurrentThreadId());
+    fflush(stdout);
+
+    g_dbiSink = DbiHotLoop(0x123456789ABCDEF0ULL);
+    printf("tester done sink=%llu\n", (unsigned long long)g_dbiSink);
     return 0;
 }
