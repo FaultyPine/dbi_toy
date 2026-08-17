@@ -23,6 +23,7 @@
 #include "external/std_ds.h"
 
 #include "shared_defines.h"
+#include "emit_x64.h"
 
 #define PEONY_SHARED_COMMS_IMPLEMENTATION
 #include "shared_comms.h"
@@ -72,7 +73,7 @@ typedef struct
 } CodeCursor;
 
 #define DBI_CODE_CACHE_SIZE (1024 * 1024)
-#define DBI_LOG_BASIC_BLOCK_COMPILE 0
+#define DBI_LOG_COMPILATION_VERBOSE 1
 
 // Stay in signed rel32 +/- 2 GB range when searching for nearby code-cache memory
 static const uintptr_t DBI_CODE_CACHE_NEAR_SEARCH_RADIUS = 0x70000000ULL;
@@ -331,15 +332,6 @@ bool ShouldWeCareAboutThisModule(SharedCommsObject* sharedComms, const ModuleInf
     return true;
 }
 
-// pseudo
-// void* LookupOrCompile(uint64_t app_pc) 
-// {
-//     if (cache[app_pc])
-//         return cache[app_pc];
-
-//     return CompileBasicBlock(app_pc);
-// }
-
 static bool IsBasicBlockTerminator(const ZydisDecodedInstruction* instr)
 {
     switch (instr->meta.category)
@@ -467,6 +459,100 @@ void OnCompileBasicBlock(CodeCursor* pOut)
     
 }
 
+
+bool IsRipRelativeMemoryOp(ZydisDecodedOperand* op)
+{
+    return op->type == ZYDIS_OPERAND_TYPE_MEMORY && (op->mem.base == ZYDIS_REGISTER_RIP || op->mem.base == ZYDIS_REGISTER_EIP);
+}
+
+bool HasRipRelativeMemoryOp(ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands)
+{
+    for (int i = 0; i < instr->operand_count_visible; i++)
+    {
+        ZydisDecodedOperand* operand = &operands[i];
+        if (IsRipRelativeMemoryOp(operand))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool EmitRelocatedInstruction(CodeCursor* cursor, uintptr_t appPc, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands)
+{
+    bool isRipRelativeMemoryOperand = HasRipRelativeMemoryOp(instr, operands);
+    if (!isRipRelativeMemoryOperand)
+    {
+        return X64EmitBytes(&cursor->cursor, (void*)appPc, instr->length);
+    }
+
+    // preparing to emit relocated instruction
+    ZydisEncoderRequest req;
+    if (ZYAN_FAILED(ZydisEncoderDecodedInstructionToEncoderRequest(
+            instr,
+            operands,
+            instr->operand_count_visible,
+            &req)))
+    {
+        PeonyLogf("Failed to create encoder request for RIP-relative instruction at %p", (void*)appPc);
+        return false;
+    }
+
+    // rip relative relocation
+    // example original instruction
+    // mov rax, qword ptr [rip + disp32]
+    // disp32 is relative to the next instruction addr, so the real memory addr we're moving into rax is
+    // absoluteTarget = original_next_rip + original_disp32;
+    // so the new displacement is
+    // new_disp32 = absoluteTarget - cache_next_rip;
+
+    uint8_t* codeCachePc = cursor->cursor;
+    for (int i = 0; i < instr->operand_count_visible; i++)
+    {
+        ZydisDecodedOperand* operand = &operands[i];
+        bool isOperandRipRelativeMemoryOp = operand->type == ZYDIS_OPERAND_TYPE_MEMORY && (operand->mem.base == ZYDIS_REGISTER_RIP || operand->mem.base == ZYDIS_REGISTER_EIP);
+        if (!isOperandRipRelativeMemoryOp)
+        {
+            continue;
+        }
+        // code cache rip to relocate to
+        // x64 rip-relative memory operands always are relative to the *next* address, hence the `+ instr->length`
+        uintptr_t newCodeCacheNextRip = (uintptr_t)codeCachePc + instr->length;
+
+        #if DBI_LOG_COMPILATION_VERBOSE
+        PeonyLogf("Relocating rip-relative mem op %p -> %p\n", appPc, newCodeCacheNextRip);
+        #endif
+
+        ZyanU64 absoluteTarget = 0;
+        if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[i], appPc, &absoluteTarget)))
+        {
+            PeonyLogf("Failed to resolve RIP-relative target at %p", (void*)appPc);
+            return false;
+        }
+
+        // from the code cache rip, can i still address the original memory target via rel32?
+        if (!IsRel32Reachable(newCodeCacheNextRip, (uintptr_t)absoluteTarget))
+        {
+            PeonyLogf("Relocated RIP-relative target is not within rel32 range! What the heck do we do???\n");
+            assert(false && "If we hit this, the program would crash/break. There's probably a way to handle this case with some extra instrumentation");
+            return false;
+        }
+        // rel32 is enough to address the original memory, so we can just do the simple math and reassign the rip-relative part of the operand
+        req.operands[i].mem.displacement = (int64_t)((uintptr_t)absoluteTarget - newCodeCacheNextRip);
+    }
+
+    // emit relocated instruction
+    ZyanUSize encodedLength = ZYDIS_MAX_INSTRUCTION_LENGTH;
+    if (ZYAN_FAILED(ZydisEncoderEncodeInstruction(&req, cursor->cursor, &encodedLength)))
+    {
+        PeonyLogf("Failed to encode relocated instruction at %p", (void*)appPc);
+        return false;
+    }
+    cursor->cursor += encodedLength;
+
+    return true;
+}
+
 // TODO: look at PC of this thread
 // if we have this basic block in the code cache, jump there i think?
 // else...
@@ -478,6 +564,13 @@ void OnCompileBasicBlock(CodeCursor* pOut)
 // Emit block exits that call/jump through LookupOrCompile.
 // Emit instrumented relocated code into executable memory.
 // copy to destination code cache block
+
+// TODO: interesting idea: what if we removed the execute permissions on the pages of memory for modules we care about
+// and install an exception handler to catch when any thread tries to execute that code. 
+// Then we dbilookuporcompile, restore exe permissions, and jump to the code cache
+// with that we can start compiling all those blocks from any threads that touch the code
+// instead of what we have now where we just pick a single thread and start jitting from there
+
 uint8_t* DbiLookupOrCompile(uintptr_t appPc)
 {
     uint8_t* existingCodeCacheEntryForThisPc = CodeCacheLookup(appPc);
@@ -492,6 +585,11 @@ uint8_t* DbiLookupOrCompile(uintptr_t appPc)
     {
         return (uint8_t*)appPc;
     }
+
+    dasm_State* D = NULL;
+    dasm_State** Dst = &D;
+    dasm_init(Dst, DASM_MAXSECTION);
+    dasm_setup(Dst, peony_dynasm_actions);
 
     size_t reserveSize = 4096;
     uint8_t* blockStart = CodeCacheReserve(reserveSize);
@@ -518,7 +616,7 @@ uint8_t* DbiLookupOrCompile(uintptr_t appPc)
     // code emitting "cursor". this points to the code cache we need to write the jitted instructions to
     CodeCursor codeOut = {.cursor = blockStart}; 
 
-#if DBI_LOG_BASIC_BLOCK_COMPILE
+#if DBI_LOG_COMPILATION_VERBOSE
     PeonyLogf("Compiling basic block at %p -> %p", (void*)appPc, blockStart);
 #endif
 
@@ -534,11 +632,11 @@ uint8_t* DbiLookupOrCompile(uintptr_t appPc)
         ZyanStatus status = ZydisDecoderDecodeFull(&decoder, (void*)currentPC, ZYDIS_MAX_INSTRUCTION_LENGTH, &instr, operands);
         if (ZYAN_FAILED(status))
         {
-            PeonyLogf("Failed to decode instruction: %lu", status);
+            PeonyLogf("Failed to decode instruction at %p: %lu", (void*)currentPC, status);
             break;
         }
-        currentPC += instr.length;
-
+        
+#if DBI_LOG_COMPILATION_VERBOSE
         if (ZYAN_FAILED(ZydisFormatterFormatInstruction(&fmt, &instr, operands,
             instr.operand_count_visible, fmt_buf, sizeof(fmt_buf), 0, NULL)))
         {
@@ -546,14 +644,35 @@ uint8_t* DbiLookupOrCompile(uintptr_t appPc)
             break;   
         }
         PeonyLogf("Original instruction: %s\n", fmt_buf);
+#endif
 
         if (IsBasicBlockTerminator(&instr))
         {
+            // TODO: handle emitting terminators for all the different control flow operations
+            // like call, ret, uncond branch, cond branch, syscall/sysret
+            currentPC += instr.length;
             break;
         }
+
+        if (!EmitRelocatedInstruction(&codeOut, currentPC, &instr, operands))
+        {
+            PeonyLogf("failed to relocate instruction at %p\n", (void*)currentPC);
+            return (uint8_t*)appPc;
+        }
+        currentPC += instr.length;
     }
-    // TODO: return code cache pc
-    return (uint8_t*)appPc;
+
+    CodeCacheEntry entry = {0};
+    entry.appPc = appPc;
+    entry.cachePc = blockStart;
+    arrput(g_codeCache.entries, entry);
+    
+#if DBI_LOG_COMPILATION_VERBOSE
+    PeonyLogf("Compiled basic block at %p -> %p  length = %llu bytes", (void*)appPc, blockStart, (DWORD64)(codeOut.cursor - blockStart));
+#endif
+
+    // return the code cache, so now the program will be executing in our instrumented code
+    return (uint8_t*)blockStart;
 }
 
 __declspec(noinline)
