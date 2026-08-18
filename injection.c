@@ -574,16 +574,8 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, uintptr_t appPc, Zyd
 // with that we can start compiling all those blocks from any threads that touch the code
 // instead of what we have now where we just pick a single thread and start jitting from there
 
-uint8_t* DbiLookupOrCompile(uintptr_t appPc)
+uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
 {
-    uint8_t* existingCodeCacheEntryForThisPc = CodeCacheLookup(appPc);
-    if (existingCodeCacheEntryForThisPc)
-    {
-        return existingCodeCacheEntryForThisPc;
-    }
-
-    // we didn't find an entry in the code cache for this pc, we need to compile this basic block
-    
     dasm_State* D = NULL;
     dasm_State** Dst = &D;
     dasm_init(Dst, DASM_MAXSECTION);
@@ -682,7 +674,17 @@ uint8_t* DbiLookupOrCompile(uintptr_t appPc)
 error:
     dasm_free(Dst);
     return (uint8_t*)appPc;
+}
 
+uint8_t* DbiLookupOrCompile(uintptr_t appPc)
+{
+    uint8_t* existingCodeCacheEntryForThisPc = CodeCacheLookup(appPc);
+    if (existingCodeCacheEntryForThisPc)
+    {
+        return existingCodeCacheEntryForThisPc;
+    }
+    // we didn't find an entry in the code cache for this pc, we need to compile this basic block
+    return DbiCompileBasicBlock(appPc);
 }
 
 __declspec(noinline)
