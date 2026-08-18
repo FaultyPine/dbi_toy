@@ -21,7 +21,6 @@
 
 #define STB_DS_IMPLEMENTATION
 #include "external/std_ds.h"
-
 #include "shared_defines.h"
 #include "emit_x64.h"
 
@@ -34,6 +33,7 @@
 
 void Initialize();
 DWORD WINAPI InitializeThread(LPVOID param);
+void DBIExitTrampoline(void);
 
 typedef struct
 {
@@ -485,7 +485,7 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, uintptr_t appPc, Zyd
     if (!isRipRelativeMemoryOperand)
     {
         #if DBI_LOG_COMPILATION_VERBOSE
-        PeonyLogf("Not rip-relative, emitting original instruction.\n");
+        PeonyLogf("Not rip-relative, emitting original instruction.");
         #endif
         return X64EmitBytes(&cursor->cursor, (void*)appPc, instr->length);
     }
@@ -523,7 +523,7 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, uintptr_t appPc, Zyd
         uintptr_t newCodeCacheNextRip = (uintptr_t)codeCachePc + instr->length;
 
         #if DBI_LOG_COMPILATION_VERBOSE
-        PeonyLogf("Relocating rip-relative mem op %p -> %p\n", appPc, newCodeCacheNextRip);
+        PeonyLogf("Relocating rip-relative mem op %p -> %p", appPc, newCodeCacheNextRip);
         #endif
 
         ZyanU64 absoluteTarget = 0;
@@ -556,17 +556,85 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, uintptr_t appPc, Zyd
     return true;
 }
 
-// TODO: look at PC of this thread
-// if we have this basic block in the code cache, jump there i think?
-// else...
-// go from that PC to end of next basic block.
-// disassemble ^ that range
-// allocate destination machine code in code cache so we have a known address of the code
-// transform disassembly with any desired instrumentation
-// re-encode transformed disasm to machine code
-// Emit block exits that call/jump through LookupOrCompile.
-// Emit instrumented relocated code into executable memory.
-// copy to destination code cache block
+bool DbiDynasmEncodeSnippet(dasm_State** Dst, CodeCursor* cursor)
+{
+    size_t size = 0;
+    int status = dasm_link(Dst, &size);
+    if (status != 0)
+    {
+        PeonyLogf("DynASM link failed with status %d", status);
+        return false;
+    }
+
+    status = dasm_encode(Dst, cursor->cursor);
+    if (status != 0)
+    {
+        PeonyLogf("DynASM encode failed with status %d", status);
+        return false;
+    }
+
+    cursor->cursor += size;
+    return true;
+}
+
+void DbiEmitDbiExitTrampoline(dasm_State** Dst, uintptr_t targetAppPC)
+{
+    // some arcane trickery here so we don't clobber registers 
+    // we split the targetAppPC into 2 32bit values so we can use an immediate mov into memory
+    // then just to make sure we can always make the jmp (jmp is rel32) we use a trick to jmp to an absolute 64bit address 
+    // by embedding our jmp target into the "next" 8 bytes after the jmp and using rip-relative jmp to target those bytes
+    uint32_t targetAppPCLow = (uint32_t)targetAppPC;
+    uint32_t targetAppPCHigh = (uint32_t)(targetAppPC >> 32);
+    | mov dword [g_hijackedThreadState.savedRegs.Rip], targetAppPCLow
+    | mov dword [g_hijackedThreadState.savedRegs.Rip+4], targetAppPCHigh
+    // Absolute indirect jump, encoded manually because DynASM doesn't accept
+    // the Intel "jmp qword ptr [rip + 0]" spelling. This preserves r10 so
+    // DBIExitTrampoline can be the single path that saves guest r10.
+    |.byte 0xff, 0x25, 0, 0, 0, 0
+    |.quad (uintptr_t)DBIExitTrampoline
+}
+
+bool CompileBlockTerminator(
+    CodeCursor* cursor, 
+    uintptr_t currentPC, 
+    ZydisDecodedInstruction* instr, 
+    ZydisDecodedOperand* operands,
+    dasm_State** Dst)
+{
+    // the PC after this terminator instruction
+    // also used as the "fallthrough" PC when we decide a branch shouldn't be taken
+    uintptr_t nextSeqAppPC = currentPC + instr->length;
+
+    bool isDirectUncondBr = instr->meta.category == ZYDIS_CATEGORY_UNCOND_BR;
+    if (isDirectUncondBr)
+    {
+        uintptr_t targetAppPC = nextSeqAppPC;
+        // EX: jmp 0xDEADBEEF
+        if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
+        {
+            ZyanU64 absoluteTarget = 0;
+            if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &absoluteTarget)))
+            {
+                PeonyLogf("Failed to resolve direct branch target at %p", (void*)currentPC);
+                return false;
+            }
+            targetAppPC = (uintptr_t)absoluteTarget;
+        }
+        else
+        {
+            PeonyLogf("Unsupported indirect unconditional branch at %p", (void*)currentPC);
+            return false;
+        }
+        DbiEmitDbiExitTrampoline(Dst, targetAppPC);
+        return DbiDynasmEncodeSnippet(Dst, cursor);
+    }
+
+    bool isDirectCondBr = instr->meta.category == ZYDIS_CATEGORY_COND_BR;
+
+    PeonyLogf("Found terminator instruction that isn't supported yet");
+    // wip
+    return false;
+}
 
 // TODO: interesting idea: what if we removed the execute permissions on the pages of memory for modules we care about
 // and install an exception handler to catch when any thread tries to execute that code. 
@@ -597,14 +665,14 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
     ZydisDecoder decoder;
     if (ZYAN_FAILED(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)))
     {
-        PeonyLogf("Failed to init zydis decoder\n");
+        PeonyLogf("Failed to init zydis decoder");
         goto error;
     }
 
     ZydisFormatter fmt;
     if (ZYAN_FAILED(ZydisFormatterInit(&fmt, ZYDIS_FORMATTER_STYLE_INTEL)))
     {
-        PeonyLogf("Failed to init zydis formatter\n");
+        PeonyLogf("Failed to init zydis formatter");
         goto error;
     }
 
@@ -636,24 +704,30 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
         if (ZYAN_FAILED(ZydisFormatterFormatInstruction(&fmt, &instr, operands,
                         instr.operand_count_visible, fmt_buf, sizeof(fmt_buf), 0, NULL)))
         {
-            PeonyLogf("Zydis failed to format instruction\n");
+            PeonyLogf("Zydis failed to format instruction");
             goto error; 
         }
-        PeonyLogf("Original instruction: %s\n", fmt_buf);
+        PeonyLogf("Original instruction: %s", fmt_buf);
 #endif
 
+        // we've hit an instruction like a branch or ret or call that "ends" the current basic block
+        // for these, we need to emit some special code that 
         if (IsBasicBlockTerminator(&instr))
         {
-            // TODO: handle emitting terminators for all the different control flow operations
+            // BOOKMARK: handle emitting terminators for all the different control flow operations
             // like call, ret, uncond branch, cond branch, syscall/sysret
-            assert(false && "Haven't implemented terminators yet");
+            if (!CompileBlockTerminator(&codeOut, currentPC, &instr, operands, Dst))
+            {
+                PeonyLogf("Failed to compile terminator at %p", currentPC);
+                goto error;
+            }
             currentPC += instr.length;
             break;
         }
 
         if (!EmitAndPossiblyRelocateInstruction(&codeOut, currentPC, &instr, operands))
         {
-            PeonyLogf("failed to emit/relocate instruction at %p\n", (void*)currentPC);
+            PeonyLogf("failed to emit/relocate instruction at %p", (void*)currentPC);
             goto error;
         }
         currentPC += instr.length;
@@ -669,6 +743,7 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
 #endif
 
     // return the code cache, so now the program will be executing in our instrumented code
+    dasm_free(Dst);
     return (uint8_t*)blockStart;
 
 error:
@@ -688,12 +763,14 @@ uint8_t* DbiLookupOrCompile(uintptr_t appPc)
 }
 
 __declspec(noinline)
-void OnThreadHijack(ThreadHijackState* state)
+void OnDBIExit(ThreadHijackState* state)
 {
-   uint64_t originalRip = state->savedRegs.Rip;
-   uint8_t* codeCacheRip = DbiLookupOrCompile(originalRip);
-   state->savedRegs.Rip = (DWORD64)codeCacheRip;
-   PeonyLogf("We have hijacked the thread into the code cache rip %p -> %p\n", originalRip, codeCacheRip);
+    uint64_t appTargetRip = state->savedRegs.Rip;
+    uint8_t* codeCacheRip = DbiLookupOrCompile(appTargetRip);
+    state->savedRegs.Rip = (DWORD64)codeCacheRip;
+#if DBI_LOG_COMPILATION_VERBOSE
+    PeonyLogf("We have hijacked the thread into the code cache rip %p -> %p\n", appTargetRip, codeCacheRip);
+#endif
 }
 
 
@@ -827,7 +904,7 @@ void SaveRegisters(void)
 
 
 __attribute__((naked))
-void RipHijackTrampoline(void)
+void DBIExitTrampoline(void)
 {
     // we want to call a C function so we must adhere to Windows x64 ABI
     // https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention?view=msvc-170
@@ -844,13 +921,13 @@ void RipHijackTrampoline(void)
         "lea r10, [rip + g_hijackedThreadState]\n"
         "call SaveRegisters\n"
 
-        "mov rcx, r10\n" // param 1 of OnThreadHijack is the state ptr
+        "mov rcx, r10\n" // param 1 of OnDBIExit is the state ptr
         "mov r13, rsp\n" // save stack ptr to nonvolatile reg so we can restore after fn call
         "and rsp, -0x10\n" // align stack ptr to 16 bytes per win x64 abi
         "sub rsp, 0x20\n" // alloc 32 bytes of shadow space on stack for win abi
-        "call OnThreadHijack\n"
+        "call OnDBIExit\n"
         "mov rsp, r13\n" // restore stack ptr
-        "lea r10, [rip + g_hijackedThreadState]\n"  // get state ptr back
+        "lea r10, [rip + g_hijackedThreadState]\n" // get state ptr back
         "call RestoreRegisters\n" // this never returns, it jmps to original rip
         "ud2\n" // we should never hit this, because RestoreRegisters should jmp to the original thread's Rip
 
@@ -914,11 +991,11 @@ bool HijackThreadRip(DWORD targetThreadId)
 
     DWORD64 originalRip = context.Rip;
     g_hijackedThreadState = (ThreadHijackState){0};
-    // SaveRegisters captures the register file after the hijacked thread resumes,
+    // SaveRegisters captures the registers after the hijacked thread resumes,
     // but it cannot recover the original app RIP after SetThreadContext redirects it.
     g_hijackedThreadState.savedRegs.Rip = originalRip;
-    // as soon as the thread resumes, it'll run our hijack asm which eventually calls our C func OnThreadHijack
-    context.Rip = (DWORD64)(uintptr_t)RipHijackTrampoline;
+    // as soon as the thread resumes, it'll run our hijack asm which eventually calls our C func OnDBIExit
+    context.Rip = (DWORD64)(uintptr_t)DBIExitTrampoline;
 
     if (!SetThreadContext(threadHdl, &context))
     {
@@ -932,7 +1009,7 @@ bool HijackThreadRip(DWORD targetThreadId)
         "Hijacked thread %lu RIP: %p -> %p, threadState=%p\n",
         targetThreadId,
         originalRip,
-        RipHijackTrampoline,
+        DBIExitTrampoline,
         &g_hijackedThreadState);
 
     ResumeThread(threadHdl);
