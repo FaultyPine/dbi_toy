@@ -484,9 +484,6 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, uintptr_t appPc, Zyd
     bool isRipRelativeMemoryOperand = HasRipRelativeMemoryOp(instr, operands);
     if (!isRipRelativeMemoryOperand)
     {
-        #if DBI_LOG_COMPILATION_VERBOSE
-        PeonyLogf("Not rip-relative, emitting original instruction.");
-        #endif
         return X64EmitBytes(&cursor->cursor, (void*)appPc, instr->length);
     }
 
