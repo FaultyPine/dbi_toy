@@ -836,16 +836,15 @@ void RipHijackTrampoline(void)
     // Integer arguments are passed in registers RCX, RDX, R8, and R9
     // https://dev.to/mirrai/x64-windows-assembly-fundamentals-part-1-what-you-actually-need-to-know-6lg
     // "Before any call the caller must allocate at least 32 bytes (0x20) on the stack even if the function takes fewer than four arguments. This is called the shadow space and it exists so the called function has somewhere to spill its register arguments if it needs to. We also allocate 8 bytes to align the stack because the winapi functions need the stack to be 16 byte aligned or the program crashes"
-    // I've already backed up r10 in g_hijackedThreadState, so that can be scratch reg at the start
     __asm__(
         ".intel_syntax noprefix\n"
 
-        // "rip-relative". We can't just load the 64bit pointer of this global
-        // there's no way to express that in x64, so this lea must be a 32bit address, but our module (and therefore the static)
-        // may be loaded outside the 4GB range a 32bit number could express. So we need to compute a 32bit address of this global
-        // so we use the current instruction pointer (rip) as a base and then offset from that to the global. 
-        "lea rcx, [rip + g_hijackedThreadState]\n"   // param 1 of the function is the state ptr
-        // don't really need to save regs here because we copy the CONTEXT before this func
+        // Save the guest r10 before using r10 as our ThreadHijackState pointer.
+        "mov qword ptr [rip + g_hijackedThreadState + " ORIGR10_OFF "], r10\n"
+        "lea r10, [rip + g_hijackedThreadState]\n"
+        "call SaveRegisters\n"
+
+        "mov rcx, r10\n" // param 1 of OnThreadHijack is the state ptr
         "mov r13, rsp\n" // save stack ptr to nonvolatile reg so we can restore after fn call
         "and rsp, -0x10\n" // align stack ptr to 16 bytes per win x64 abi
         "sub rsp, 0x20\n" // alloc 32 bytes of shadow space on stack for win abi
@@ -904,8 +903,7 @@ bool HijackThreadRip(DWORD targetThreadId)
 
     CONTEXT context;
     memset(&context, 0, sizeof(context));
-    // just ctrl regs and standard int regs for now...?
-    context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER; 
+    context.ContextFlags = CONTEXT_CONTROL;
     if (!GetThreadContext(threadHdl, &context))
     {
         PeonyLogf("GetThreadContext(%lu) failed: %lu", targetThreadId, GetLastError());
@@ -916,10 +914,9 @@ bool HijackThreadRip(DWORD targetThreadId)
 
     DWORD64 originalRip = context.Rip;
     g_hijackedThreadState = (ThreadHijackState){0};
-    // r10 is our "scratch space" before we save off regs, so we back it up here
-    g_hijackedThreadState.originalR10 = context.R10;
-    // saving off the thread context so we can restore it after our trampoline
-    g_hijackedThreadState.savedRegs = context;
+    // SaveRegisters captures the register file after the hijacked thread resumes,
+    // but it cannot recover the original app RIP after SetThreadContext redirects it.
+    g_hijackedThreadState.savedRegs.Rip = originalRip;
     // as soon as the thread resumes, it'll run our hijack asm which eventually calls our C func OnThreadHijack
     context.Rip = (DWORD64)(uintptr_t)RipHijackTrampoline;
 
