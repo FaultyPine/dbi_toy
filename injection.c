@@ -574,21 +574,24 @@ bool DbiDynasmEncodeSnippet(dasm_State** Dst, CodeCursor* cursor)
     return true;
 }
 
-void DbiEmitDbiExitTrampoline(dasm_State** Dst, uintptr_t targetAppPC)
+static bool DbiEmitDbiExitTrampoline(dasm_State** Dst, CodeCursor* cursor, uintptr_t targetAppPC)
 {
-    // some arcane trickery here so we don't clobber registers 
-    // we split the targetAppPC into 2 32bit values so we can use an immediate mov into memory
-    // then just to make sure we can always make the jmp (jmp is rel32) we use a trick to jmp to an absolute 64bit address 
-    // by embedding our jmp target into the "next" 8 bytes after the jmp and using rip-relative jmp to target those bytes
-    uint32_t targetAppPCLow = (uint32_t)targetAppPC;
-    uint32_t targetAppPCHigh = (uint32_t)(targetAppPC >> 32);
-    | mov dword [g_hijackedThreadState.savedRegs.Rip], targetAppPCLow
-    | mov dword [g_hijackedThreadState.savedRegs.Rip+4], targetAppPCHigh
+    // The code cache is allocated near app code, not necessarily near this DLL's
+    // globals, so don't use RIP-relative addressing for DBI state here.
+    | push r10
+    | push r11
+    | mov64 r10, (uintptr_t)&g_hijackedThreadState.savedRegs.Rip
+    | mov64 r11, targetAppPC
+    | mov qword [r10], r11
+    | pop r11
+    | pop r10
     // Absolute indirect jump, encoded manually because DynASM doesn't accept
-    // the Intel "jmp qword ptr [rip + 0]" spelling. This preserves r10 so
-    // DBIExitTrampoline can be the single path that saves guest r10.
-    |.byte 0xff, 0x25, 0, 0, 0, 0
+    // the Intel "jmp qword ptr [rip + 0]" spelling.
+    // we do it this weird way so we don't need to clobber any registers before the jump
+    // because the exit function here will never return
+    |.byte 0xff, 0x25, 0, 0, 0, 0 // "jmp qword ptr [rip + 0]"
     |.quad (uintptr_t)DBIExitTrampoline
+    return DbiDynasmEncodeSnippet(Dst, cursor);
 }
 
 bool CompileBlockTerminator(
@@ -622,8 +625,7 @@ bool CompileBlockTerminator(
             PeonyLogf("Unsupported indirect unconditional branch at %p", (void*)currentPC);
             return false;
         }
-        DbiEmitDbiExitTrampoline(Dst, targetAppPC);
-        return DbiDynasmEncodeSnippet(Dst, cursor);
+        return DbiEmitDbiExitTrampoline(Dst, cursor, targetAppPC);
     }
 
     bool isDirectCondBr = instr->meta.category == ZYDIS_CATEGORY_COND_BR;
