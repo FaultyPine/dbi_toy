@@ -31,10 +31,6 @@
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "user32.lib")
 
-void Initialize();
-DWORD WINAPI InitializeThread(LPVOID param);
-void DBIExitTrampoline(void);
-
 typedef struct
 {
     DWORD64 originalR10;
@@ -48,13 +44,21 @@ typedef struct
 _Static_assert(offsetof(ThreadHijackState, originalR10) == ORIGR10_OFF_NUM, "unexpected ThreadHijackState layout");
 _Static_assert(offsetof(ThreadHijackState, savedRegs) == SAVEDREGS_OFF_NUM, "unexpected ThreadHijackState layout");
 
-static ThreadHijackState g_hijackedThreadState;
-static SharedLogObject* g_sharedLog;
+typedef struct 
+{
+    char moduleName[MAX_MODULE_NAME32 + 1];
+    char exePath[MAX_PATH];
+    DWORD_PTR moduleBaseAddress;
+    DWORD moduleSize;
+} ModuleInfo;
 
-// scratch for holding the next PC we should go to
-|.define DBI_DISPATCH_REG, r11
-// holds our global state, usually g_hijackedThreadState or something inside it
-|.define DBI_STATE_REG, r10
+typedef struct 
+{
+    // arbitrary limit...
+    #define THREAD_NAME_MAX_LEN MAX_PATH
+    char threadName[THREAD_NAME_MAX_LEN];
+    DWORD threadId;
+} ThreadInfo;
 
 
 typedef struct
@@ -81,8 +85,50 @@ typedef struct
 #define DBI_CODE_CACHE_SIZE (1024 * 1024)
 #define DBI_LOG_COMPILATION_VERBOSE 1
 
+static ThreadHijackState g_hijackedThreadState;
+static SharedLogObject* g_sharedLog;
+
+// scratch for holding the next PC we should go to
+|.define DBI_DISPATCH_REG, r11
+// holds our global state, usually g_hijackedThreadState or something inside it
+|.define DBI_STATE_REG, r10
+
 // Stay in signed rel32 +/- 2 GB range when searching for nearby code-cache memory
 static const uintptr_t DBI_CODE_CACHE_NEAR_SEARCH_RADIUS = 0x70000000ULL;
+
+void Initialize();
+DWORD WINAPI InitializeThread(LPVOID param);
+void DBIExitTrampoline(void);
+
+
+BOOL WINAPI DllMain(
+    HINSTANCE hinstDLL,
+    DWORD fdwReason,
+    LPVOID lpReserved)
+{
+    switch(fdwReason) 
+    { 
+        case DLL_PROCESS_ATTACH:
+        {
+            HANDLE initThread = CreateThread(NULL, 0, InitializeThread, NULL, 0, NULL);
+            if (initThread)
+            {
+                CloseHandle(initThread);
+            }
+        } break;
+        case DLL_THREAD_ATTACH:
+        {
+        } break;
+        case DLL_THREAD_DETACH:
+        {
+        } break;
+        case DLL_PROCESS_DETACH:
+        {
+        } break;
+    }
+    return TRUE;
+}
+
 
 static uintptr_t AlignDownToPowerOfTwo(uintptr_t value, uintptr_t alignment)
 {
@@ -186,32 +232,79 @@ void PeonyLogf(const char* format, ...)
 }
 
 
-BOOL WINAPI DllMain(
-    HINSTANCE hinstDLL,
-    DWORD fdwReason,
-    LPVOID lpReserved)
+static void LogDecodedInstructionRange(
+    const char* title,
+    ZydisDecoder* decoder,
+    ZydisFormatter* formatter,
+    uintptr_t runtimeStart,
+    size_t byteLength)
 {
-    switch(fdwReason) 
-    { 
-        case DLL_PROCESS_ATTACH:
+    PeonyLogf("%s [%p, %p) %llu bytes", title, (void*)runtimeStart, (void*)(runtimeStart + byteLength), (DWORD64)byteLength);
+
+    uintptr_t runtimePc = runtimeStart;
+    const uint8_t* bytes = (const uint8_t*)runtimeStart;
+    size_t remaining = byteLength;
+    while (remaining > 0)
+    {
+        ZydisDecodedInstruction instr;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        ZyanStatus status = ZydisDecoderDecodeFull(decoder, bytes, remaining, &instr, operands);
+        if (ZYAN_FAILED(status))
         {
-            HANDLE initThread = CreateThread(NULL, 0, InitializeThread, NULL, 0, NULL);
-            if (initThread)
-            {
-                CloseHandle(initThread);
-            }
-        } break;
-        case DLL_THREAD_ATTACH:
+            PeonyLogf("  %p  <decode failed: %lu>", (void*)runtimePc, status);
+            return;
+        }
+
+        char instrBuf[256] = {0};
+        if (ZYAN_FAILED(ZydisFormatterFormatInstruction(
+                formatter,
+                &instr,
+                operands,
+                instr.operand_count_visible,
+                instrBuf,
+                sizeof(instrBuf),
+                runtimePc,
+                NULL)))
         {
-        } break;
-        case DLL_THREAD_DETACH:
-        {
-        } break;
-        case DLL_PROCESS_DETACH:
-        {
-        } break;
+            PeonyLogf("  %p <format failed>", (void*)runtimePc);
+            return;
+        }
+
+        PeonyLogf("%s", instrBuf);
+
+        runtimePc += instr.length;
+        bytes += instr.length;
+        remaining -= instr.length;
     }
-    return TRUE;
+}
+
+static void LogCompiledBasicBlockComparison(
+    ZydisDecoder* decoder,
+    ZydisFormatter* formatter,
+    uintptr_t appStart,
+    uintptr_t appEnd,
+    uint8_t* cacheStart,
+    uint8_t* cacheEnd)
+{
+    PeonyLogf(
+        "\n--------------------\nBasic block compile comparison app [%p, %p) -> cache [%p, %p)",
+        (void*)appStart,
+        (void*)appEnd,
+        cacheStart,
+        cacheEnd);
+    LogDecodedInstructionRange(
+        "Original app instructions",
+        decoder,
+        formatter,
+        appStart,
+        (size_t)(appEnd - appStart));
+    LogDecodedInstructionRange(
+        "Emitted code cache instructions",
+        decoder,
+        formatter,
+        (uintptr_t)cacheStart,
+        (size_t)(cacheEnd - cacheStart));
+    PeonyLogf("\n--------------------\n");
 }
 
 DWORD WINAPI InitializeThread(LPVOID param)
@@ -220,22 +313,6 @@ DWORD WINAPI InitializeThread(LPVOID param)
     Initialize();
     return 0;
 }
-
-typedef struct 
-{
-    char moduleName[MAX_MODULE_NAME32 + 1];
-    char exePath[MAX_PATH];
-    DWORD_PTR moduleBaseAddress;
-    DWORD moduleSize;
-} ModuleInfo;
-
-typedef struct 
-{
-    // arbitrary limit...
-    #define THREAD_NAME_MAX_LEN MAX_PATH
-    char threadName[THREAD_NAME_MAX_LEN];
-    DWORD threadId;
-} ThreadInfo;
 
 ModuleInfo* ListProcessModules(DWORD pid)
 {
@@ -789,81 +866,6 @@ bool CompileBlockTerminator(
         } break;
     }
     return false;
-}
-
-static void LogDecodedInstructionRange(
-    const char* title,
-    ZydisDecoder* decoder,
-    ZydisFormatter* formatter,
-    uintptr_t runtimeStart,
-    size_t byteLength)
-{
-    PeonyLogf("%s [%p, %p) %llu bytes", title, (void*)runtimeStart, (void*)(runtimeStart + byteLength), (DWORD64)byteLength);
-
-    uintptr_t runtimePc = runtimeStart;
-    const uint8_t* bytes = (const uint8_t*)runtimeStart;
-    size_t remaining = byteLength;
-    while (remaining > 0)
-    {
-        ZydisDecodedInstruction instr;
-        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-        ZyanStatus status = ZydisDecoderDecodeFull(decoder, bytes, remaining, &instr, operands);
-        if (ZYAN_FAILED(status))
-        {
-            PeonyLogf("  %p  <decode failed: %lu>", (void*)runtimePc, status);
-            return;
-        }
-
-        char instrBuf[256] = {0};
-        if (ZYAN_FAILED(ZydisFormatterFormatInstruction(
-                formatter,
-                &instr,
-                operands,
-                instr.operand_count_visible,
-                instrBuf,
-                sizeof(instrBuf),
-                runtimePc,
-                NULL)))
-        {
-            PeonyLogf("  %p <format failed>", (void*)runtimePc);
-            return;
-        }
-
-        PeonyLogf("%s", instrBuf);
-
-        runtimePc += instr.length;
-        bytes += instr.length;
-        remaining -= instr.length;
-    }
-}
-
-static void LogCompiledBasicBlockComparison(
-    ZydisDecoder* decoder,
-    ZydisFormatter* formatter,
-    uintptr_t appStart,
-    uintptr_t appEnd,
-    uint8_t* cacheStart,
-    uint8_t* cacheEnd)
-{
-    PeonyLogf(
-        "\n--------------------\nBasic block compile comparison app [%p, %p) -> cache [%p, %p)",
-        (void*)appStart,
-        (void*)appEnd,
-        cacheStart,
-        cacheEnd);
-    LogDecodedInstructionRange(
-        "Original app instructions",
-        decoder,
-        formatter,
-        appStart,
-        (size_t)(appEnd - appStart));
-    LogDecodedInstructionRange(
-        "Emitted code cache instructions",
-        decoder,
-        formatter,
-        (uintptr_t)cacheStart,
-        (size_t)(cacheEnd - cacheStart));
-    PeonyLogf("\n--------------------\n");
 }
 
 // TODO: interesting idea: what if we removed the execute permissions on the pages of memory for modules we care about
