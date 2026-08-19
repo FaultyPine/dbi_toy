@@ -768,7 +768,7 @@ bool CompileBlockTerminator(
     
     switch (instr->meta.category)
     {
-        // TODO: still need to support memory targets, rip-relative memory targets, register targets
+        // BOOKMARK: still need to support memory targets, rip-relative memory targets, register targets
         //      for both uncond br and call
         case ZYDIS_CATEGORY_UNCOND_BR:
         {
@@ -817,7 +817,6 @@ bool CompileBlockTerminator(
             DbiEmitDbiExitTrampoline(Dst, takenAddress);
             return DbiDynasmEncodeSnippet(Dst, cursor); 
         } break;
-        // BOOKMARK: implement call
         case ZYDIS_CATEGORY_CALL:
         {
             uintptr_t targetAddress = 0;
