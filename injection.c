@@ -51,6 +51,12 @@ _Static_assert(offsetof(ThreadHijackState, savedRegs) == SAVEDREGS_OFF_NUM, "une
 static ThreadHijackState g_hijackedThreadState;
 static SharedLogObject* g_sharedLog;
 
+// scratch for holding the next PC we should go to
+|.define DBI_DISPATCH_REG, r11
+// holds our global state, usually g_hijackedThreadState or something inside it
+|.define DBI_STATE_REG, r10
+
+
 typedef struct
 {
     uintptr_t appPc;
@@ -594,28 +600,28 @@ bool DbiDynasmEncodeSnippet(dasm_State** Dst, CodeCursor* cursor)
     return true;
 }
 
-#define DBI_EXIT_TRAMPOLINE_INDICATE_R11_HAS_TARGET_PC -1
+#define DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC -1
 static void DbiEmitDbiExitTrampoline(dasm_State** Dst, uintptr_t targetAppPC)
 {
-    bool doesR11AlreadyHaveTargetPC = targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_R11_HAS_TARGET_PC;
+    bool doesDispatchRegAlreadyHaveTargetPC = targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC;
     // The code cache is allocated near app code, not necessarily near this DLL's
     // globals, so don't use RIP-relative addressing for DBI state here.
-    | push r10
-    if (!doesR11AlreadyHaveTargetPC)
+    | push DBI_STATE_REG
+    if (!doesDispatchRegAlreadyHaveTargetPC)
     {
-        | push r11
+        | push DBI_DISPATCH_REG
     }
-    | mov64 r10, (uintptr_t)&g_hijackedThreadState.savedRegs.Rip
-    if (!doesR11AlreadyHaveTargetPC)
+    | mov64 DBI_STATE_REG, (uintptr_t)&g_hijackedThreadState.savedRegs.Rip
+    if (!doesDispatchRegAlreadyHaveTargetPC)
     {
-        | mov64 r11, targetAppPC
+        | mov64 DBI_DISPATCH_REG, targetAppPC
     }
-    | mov qword [r10], r11
-    if (!doesR11AlreadyHaveTargetPC)
+    | mov qword [DBI_STATE_REG], DBI_DISPATCH_REG
+    if (!doesDispatchRegAlreadyHaveTargetPC)
     {
-        | pop r11
+        | pop DBI_DISPATCH_REG
     }
-    | pop r10
+    | pop DBI_STATE_REG
     // Absolute indirect jump, encoded manually because DynASM doesn't accept
     // the Intel "jmp qword ptr [rip + 0]" spelling.
     // we do it this weird way so we don't need to clobber any registers before the jump
@@ -737,9 +743,13 @@ bool CompileBlockTerminator(
         } break;
         case ZYDIS_CATEGORY_RET:
         {
-            | pop r11
-            DbiEmitDbiExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_R11_HAS_TARGET_PC);
+            | pop DBI_DISPATCH_REG
+            DbiEmitDbiExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
             return DbiDynasmEncodeSnippet(Dst, cursor); 
+        } break;
+        case ZYDIS_CATEGORY_CALL:
+        {
+
         } break;
         default:
         {
