@@ -459,6 +459,26 @@ void OnCompileBasicBlock(CodeCursor* pOut)
     
 }
 
+bool GetRelativeTarget(
+    const ZydisDecodedInstruction* instr,
+    const ZydisDecodedOperand* operands,
+    uintptr_t instructionAddress,
+    uintptr_t* outTarget)
+{
+    for (int i = 0; i < instr->operand_count_visible; i++)
+    {
+        if (operands[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && operands[i].imm.is_relative)
+        {
+            ZyanU64 target = 0;
+            if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(instr, &operands[i], instructionAddress, &target)))
+            {
+                *outTarget = (uintptr_t)target;
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 bool IsRipRelativeMemoryOp(ZydisDecodedOperand* op)
 {
@@ -574,16 +594,27 @@ bool DbiDynasmEncodeSnippet(dasm_State** Dst, CodeCursor* cursor)
     return true;
 }
 
-static bool DbiEmitDbiExitTrampoline(dasm_State** Dst, CodeCursor* cursor, uintptr_t targetAppPC)
+#define DBI_EXIT_TRAMPOLINE_INDICATE_R11_HAS_TARGET_PC -1
+static void DbiEmitDbiExitTrampoline(dasm_State** Dst, uintptr_t targetAppPC)
 {
+    bool doesR11AlreadyHaveTargetPC = targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_R11_HAS_TARGET_PC;
     // The code cache is allocated near app code, not necessarily near this DLL's
     // globals, so don't use RIP-relative addressing for DBI state here.
     | push r10
-    | push r11
+    if (!doesR11AlreadyHaveTargetPC)
+    {
+        | push r11
+    }
     | mov64 r10, (uintptr_t)&g_hijackedThreadState.savedRegs.Rip
-    | mov64 r11, targetAppPC
+    if (!doesR11AlreadyHaveTargetPC)
+    {
+        | mov64 r11, targetAppPC
+    }
     | mov qword [r10], r11
-    | pop r11
+    if (!doesR11AlreadyHaveTargetPC)
+    {
+        | pop r11
+    }
     | pop r10
     // Absolute indirect jump, encoded manually because DynASM doesn't accept
     // the Intel "jmp qword ptr [rip + 0]" spelling.
@@ -591,7 +622,54 @@ static bool DbiEmitDbiExitTrampoline(dasm_State** Dst, CodeCursor* cursor, uintp
     // because the exit function here will never return
     |.byte 0xff, 0x25, 0, 0, 0, 0 // "jmp qword ptr [rip + 0]"
     |.quad (uintptr_t)DBIExitTrampoline
-    return DbiDynasmEncodeSnippet(Dst, cursor);
+}
+
+bool DbiEmitJccToLabel1(dasm_State** Dst, ZydisMnemonic mnemonic)
+{
+    // crash course on dynasm labels
+    // local labels numbered 1-9, they are reusable
+    // >1 means "the next 1" and <1 means "the previous 1"
+
+    // i added a couple common ones, but if we hit one that isn't here, this is the list of em all
+    // https://www.felixcloutier.com/x86/jcc
+    switch (mnemonic)
+    {
+        case ZYDIS_MNEMONIC_JZ:   
+        | jz >1; 
+        return true;
+        case ZYDIS_MNEMONIC_JNZ:  
+        | jnz >1; 
+        return true;
+        case ZYDIS_MNEMONIC_JB:   
+        | jb >1; 
+        return true;
+        case ZYDIS_MNEMONIC_JNB:  
+        | jnb >1; 
+        return true;
+        case ZYDIS_MNEMONIC_JBE:  
+        | jbe >1; 
+        return true;
+        case ZYDIS_MNEMONIC_JNBE: 
+        | jnbe >1; 
+        return true;
+        case ZYDIS_MNEMONIC_JL:   
+        | jl >1; 
+        return true;
+        case ZYDIS_MNEMONIC_JNL:  
+        | jnl >1; 
+        return true;
+        case ZYDIS_MNEMONIC_JLE:  
+        | jle >1; 
+        return true;
+        case ZYDIS_MNEMONIC_JNLE: 
+        | jnle >1; 
+        return true;
+        case ZYDIS_MNEMONIC_JO:   
+        | jo >1; 
+        return true;
+        default:
+            return false;
+    }
 }
 
 bool CompileBlockTerminator(
@@ -604,31 +682,70 @@ bool CompileBlockTerminator(
     // the PC after this terminator instruction
     // also used as the "fallthrough" PC when we decide a branch shouldn't be taken
     uintptr_t nextSeqAppPC = currentPC + instr->length;
+    
+    // BOOKMARK: handle emitting terminators for all the different control flow operations
+    // like call, ret, uncond branch, cond branch, syscall/sysret
 
-    bool isDirectUncondBr = instr->meta.category == ZYDIS_CATEGORY_UNCOND_BR;
-    if (isDirectUncondBr)
+    switch (instr->meta.category)
     {
-        uintptr_t targetAppPC = nextSeqAppPC;
-        // EX: jmp 0xDEADBEEF
-        if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
+        case ZYDIS_CATEGORY_UNCOND_BR:
         {
-            ZyanU64 absoluteTarget = 0;
-            if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &absoluteTarget)))
+            assert(instr->meta.branch_type != ZYDIS_BRANCH_TYPE_FAR); // NYI
+
+            uintptr_t targetAppPC = nextSeqAppPC;
+            // EX: jmp 0xDEADBEEF
+            if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
             {
-                PeonyLogf("Failed to resolve direct branch target at %p", (void*)currentPC);
+                ZyanU64 absoluteTarget = 0;
+                if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &absoluteTarget)))
+                {
+                    PeonyLogf("Failed to resolve direct branch target at %p", (void*)currentPC);
+                    return false;
+                }
+                targetAppPC = (uintptr_t)absoluteTarget;
+            }
+            else
+            {
+                // TODO: still need to support memory targets, rip-relative memory targets, register targets
+                PeonyLogf("Unsupported indirect unconditional branch at %p", (void*)currentPC);
                 return false;
             }
-            targetAppPC = (uintptr_t)absoluteTarget;
-        }
-        else
+            DbiEmitDbiExitTrampoline(Dst, targetAppPC);
+            return DbiDynasmEncodeSnippet(Dst, cursor); 
+        } break;
+        case ZYDIS_CATEGORY_COND_BR:
         {
-            PeonyLogf("Unsupported indirect unconditional branch at %p", (void*)currentPC);
-            return false;
-        }
-        return DbiEmitDbiExitTrampoline(Dst, cursor, targetAppPC);
+            assert(instr->meta.branch_type != ZYDIS_BRANCH_TYPE_FAR);
+            // for conditional branches in x64 they're, always rel32 or rel8.
+            // at this point, the progrma already has done the comparison, so rflags is ready.
+            // we need to emit the original branch jcc code, and make sure the branch target address
+            // hits the DBI again with the correct target pc
+            uintptr_t takenAddress = 0;
+            if (!GetRelativeTarget(instr, operands, currentPC, &takenAddress))
+            {
+                PeonyLogf("Unsupported non-relative conditional branch at %p", currentPC);
+                return false;
+            }
+            if (!DbiEmitJccToLabel1(Dst, instr->mnemonic))
+            {
+                PeonyLogf("Unsupported conditional branch Jcc code at %p", currentPC);
+            }
+            DbiEmitDbiExitTrampoline(Dst, nextSeqAppPC);
+            |1:
+            DbiEmitDbiExitTrampoline(Dst, takenAddress);
+            return DbiDynasmEncodeSnippet(Dst, cursor); 
+        } break;
+        case ZYDIS_CATEGORY_RET:
+        {
+            | pop r11
+            DbiEmitDbiExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_R11_HAS_TARGET_PC);
+            return DbiDynasmEncodeSnippet(Dst, cursor); 
+        } break;
+        default:
+        {
+            
+        } break;
     }
-
-    bool isDirectCondBr = instr->meta.category == ZYDIS_CATEGORY_COND_BR;
 
     PeonyLogf("Found terminator instruction that isn't supported yet");
     // wip
@@ -722,7 +839,7 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
     dasm_State* D = NULL;
     dasm_State** Dst = &D;
     dasm_init(Dst, DASM_MAXSECTION);
-    //dasm_setupglobal(Dst, ) // ?
+    dasm_setupglobal(Dst, NULL, 0);
     dasm_setup(Dst, peony_dynasm_actions);
     
     if (!CodeCacheInit(appPc))
@@ -778,8 +895,6 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
         // for these, we need to emit some special code that 
         if (IsBasicBlockTerminator(&instr))
         {
-            // BOOKMARK: handle emitting terminators for all the different control flow operations
-            // like call, ret, uncond branch, cond branch, syscall/sysret
             if (!CompileBlockTerminator(&codeOut, currentPC, &instr, operands, Dst))
             {
                 LogDecodedInstructionRange("Terminator that failed to compile", &decoder, &fmt, currentPC, instr.length);
@@ -832,9 +947,6 @@ void OnDBIExit(ThreadHijackState* state)
     uint64_t appTargetRip = state->savedRegs.Rip;
     uint8_t* codeCacheRip = DbiLookupOrCompile(appTargetRip);
     state->savedRegs.Rip = (DWORD64)codeCacheRip;
-#if DBI_LOG_COMPILATION_VERBOSE
-    PeonyLogf("We have hijacked the thread into the code cache rip %p -> %p\n", appTargetRip, codeCacheRip);
-#endif
 }
 
 
