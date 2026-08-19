@@ -689,11 +689,10 @@ bool CompileBlockTerminator(
     // also used as the "fallthrough" PC when we decide a branch shouldn't be taken
     uintptr_t nextSeqAppPC = currentPC + instr->length;
     
-    // BOOKMARK: handle emitting terminators for all the different control flow operations
-    // like call, ret, uncond branch, cond branch, syscall/sysret
-
     switch (instr->meta.category)
     {
+        // TODO: still need to support memory targets, rip-relative memory targets, register targets
+        //      for both uncond br and call
         case ZYDIS_CATEGORY_UNCOND_BR:
         {
             assert(instr->meta.branch_type != ZYDIS_BRANCH_TYPE_FAR); // NYI
@@ -712,7 +711,6 @@ bool CompileBlockTerminator(
             }
             else
             {
-                // TODO: still need to support memory targets, rip-relative memory targets, register targets
                 PeonyLogf("Unsupported indirect unconditional branch at %p", (void*)currentPC);
                 return false;
             }
@@ -735,10 +733,31 @@ bool CompileBlockTerminator(
             if (!DbiEmitJccToLabel1(Dst, instr->mnemonic))
             {
                 PeonyLogf("Unsupported conditional branch Jcc code at %p", currentPC);
+                return false;
             }
             DbiEmitDbiExitTrampoline(Dst, nextSeqAppPC);
             |1:
             DbiEmitDbiExitTrampoline(Dst, takenAddress);
+            return DbiDynasmEncodeSnippet(Dst, cursor); 
+        } break;
+        // BOOKMARK: implement call
+        case ZYDIS_CATEGORY_CALL:
+        {
+            uintptr_t targetAddress = 0;
+            if (!GetRelativeTarget(instr, operands, currentPC, &targetAddress))
+            {
+                PeonyLogf("Unsupported non-relative conditional branch at %p", currentPC);
+                return false;
+            }
+            // we push the "return" address on the stack.
+            // we will be returning to this current (really, next) pc
+            // we dont want to clobber regs here, so we use this xchg trick on the stack 
+            // to make sure DBI_DISPATCH_REG is the same as before, and top of the stack has the return address (nextSeqAppPC)
+            | push DBI_DISPATCH_REG
+            | mov64 DBI_DISPATCH_REG, nextSeqAppPC
+            // swap the content of memory & register w/o needing a temp
+            | xchg qword [rsp], DBI_DISPATCH_REG
+            DbiEmitDbiExitTrampoline(Dst, targetAddress);
             return DbiDynasmEncodeSnippet(Dst, cursor); 
         } break;
         case ZYDIS_CATEGORY_RET:
@@ -747,18 +766,28 @@ bool CompileBlockTerminator(
             DbiEmitDbiExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
             return DbiDynasmEncodeSnippet(Dst, cursor); 
         } break;
-        case ZYDIS_CATEGORY_CALL:
+        case ZYDIS_CATEGORY_SYSCALL:
         {
-
+            if (!EmitAndPossiblyRelocateInstruction(cursor, currentPC, instr, operands))
+            {
+                PeonyLogf("Something went wrong emitting instructions for syscall/sysret");
+                return false;
+            }
+            DbiEmitDbiExitTrampoline(Dst, nextSeqAppPC);
+            return DbiDynasmEncodeSnippet(Dst, cursor); 
         } break;
         default:
         {
-            
+            PeonyLogf("Unsupported terminator category %u at %p. Defaulting to fallthrough pc", instr->meta.category, currentPC);
+            if (!EmitAndPossiblyRelocateInstruction(cursor, currentPC, instr, operands))
+            {
+                PeonyLogf("Something went wrong emitting instructions for an unknown terminator");
+                return false;
+            }
+            DbiEmitDbiExitTrampoline(Dst, nextSeqAppPC);
+            return DbiDynasmEncodeSnippet(Dst, cursor); 
         } break;
     }
-
-    PeonyLogf("Found terminator instruction that isn't supported yet");
-    // wip
     return false;
 }
 
@@ -922,6 +951,8 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
         currentPC += instr.length;
     }
 
+    FlushInstructionCache(GetCurrentProcess(), blockStart, codeOut.cursor - blockStart);
+
     CodeCacheEntry entry = {0};
     entry.appPc = appPc;
     entry.cachePc = blockStart;
@@ -930,6 +961,7 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
 #if DBI_LOG_COMPILATION_VERBOSE
     LogCompiledBasicBlockComparison(&decoder, &fmt, appPc, currentPC, blockStart, codeOut.cursor);
 #endif
+    PeonyLogf("There are now %lu entries in the code cache", arrlen(g_codeCache.entries));
 
     // return the code cache, so now the program will be executing in our instrumented code
     dasm_free(Dst);
