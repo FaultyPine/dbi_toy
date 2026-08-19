@@ -63,8 +63,8 @@ typedef struct
 
 typedef struct
 {
-    uintptr_t appPc;
-    uint8_t* cachePc;
+    uintptr_t key; // app pc
+    uint8_t* value; // code cache pc
 } CodeCacheEntry;
 
 typedef struct
@@ -72,7 +72,7 @@ typedef struct
     uint8_t* base;
     size_t capacity;
     size_t used;
-    CodeCacheEntry* entries; // arr
+    CodeCacheEntry* entries; // hm: app PC -> code-cache PC
 } CodeCache;
 
 static CodeCache g_codeCache;
@@ -447,15 +447,12 @@ static bool IsBasicBlockTerminator(const ZydisDecodedInstruction* instr)
 
 uint8_t* CodeCacheLookup(uint64_t appPc)
 {
-    for (int i = 0; i < arrlen(g_codeCache.entries); i++)
+    if (!g_codeCache.entries)
     {
-        CodeCacheEntry* entry = &g_codeCache.entries[i];
-        if (entry->appPc == appPc)
-        {
-            return entry->cachePc;
-        }
+        return NULL;
     }
-    return NULL;
+    CodeCacheEntry* entry = hmgetp_null(g_codeCache.entries, appPc);
+    return entry ? entry->value : NULL;
 }
 
 // tries to initialize code cache memory within rel32 range of 'nearPc'
@@ -854,14 +851,8 @@ bool CompileBlockTerminator(
         } break;
         default:
         {
-            PeonyLogf("Unsupported terminator category %u at %p. Defaulting to fallthrough pc", instr->meta.category, currentPC);
-            if (!EmitAndPossiblyRelocateInstruction(cursor, currentPC, instr, operands))
-            {
-                PeonyLogf("Something went wrong emitting instructions for an unknown terminator");
-                return false;
-            }
-            DbiEmitDbiExitTrampoline(Dst, nextSeqAppPC);
-            return DbiDynasmEncodeSnippet(Dst, cursor); 
+            PeonyLogf("Unsupported terminator category %u at %p. ", instr->meta.category, currentPC);
+            return false;
         } break;
     }
     return false;
@@ -954,15 +945,12 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
 
     FlushInstructionCache(GetCurrentProcess(), blockStart, codeOut.cursor - blockStart);
 
-    CodeCacheEntry entry = {0};
-    entry.appPc = appPc;
-    entry.cachePc = blockStart;
-    arrput(g_codeCache.entries, entry);
+    hmput(g_codeCache.entries, appPc, blockStart);
     
 #if DBI_LOG_COMPILATION_VERBOSE
     LogCompiledBasicBlockComparison(&decoder, &fmt, appPc, currentPC, blockStart, codeOut.cursor);
 #endif
-    PeonyLogf("There are now %lu entries in the code cache", arrlen(g_codeCache.entries));
+    PeonyLogf("There are now %llu entries in the code cache", (unsigned long long)hmlenu(g_codeCache.entries));
 
     // return the code cache, so now the program will be executing in our instrumented code
     dasm_free(Dst);
