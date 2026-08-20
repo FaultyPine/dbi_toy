@@ -700,7 +700,8 @@ void OnCompileBasicBlock(CodeCursor* pOut)
     
 }
 
-bool GetRelativeTarget(
+// are we looking at a direct (immediate) relative instruction
+bool GetDirectRelativeTarget(
     const ZydisDecodedInstruction* instr,
     const ZydisDecodedOperand* operands,
     uintptr_t instructionAddress,
@@ -951,40 +952,10 @@ bool CompileBlockTerminator(
     {
         // BOOKMARK: still need to support memory targets, rip-relative memory targets, register targets
         //      for both uncond br and call
-        case ZYDIS_CATEGORY_COND_BR:
-        {
-            assert(instr->meta.branch_type != ZYDIS_BRANCH_TYPE_FAR);
-            // for conditional branches in x64 they're, always rel32 or rel8.
-            // at this point, the progrma already has done the comparison, so rflags is ready.
-            // we need to emit the original branch jcc code, and make sure the branch target address
-            // hits the DBI again with the correct target pc
-            uintptr_t takenAddress = 0;
-            if (!GetRelativeTarget(instr, operands, currentPC, &takenAddress))
-            {
-                PeonyLogf("Unsupported non-relative conditional branch at %p", currentPC);
-                return false;
-            }
-
-            if (!DbiEmitJccToLabel1(Dst, instr->mnemonic))
-            {
-                PeonyLogf("Unsupported conditional branch Jcc code at %p", currentPC);
-                return false;
-            }
-            if (!DbiEmitPatchableExit(Dst, nextSeqAppPC, patchLabels))
-            {
-                return false;
-            }
-            |1:
-            if (!DbiEmitPatchableExit(Dst, takenAddress, patchLabels))
-            {
-                return false;
-            }
-            return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
-        } break;
         case ZYDIS_CATEGORY_CALL:
         {
             uintptr_t targetAddress = 0;
-            if (!GetRelativeTarget(instr, operands, currentPC, &targetAddress))
+            if (!GetDirectRelativeTarget(instr, operands, currentPC, &targetAddress))
             {
                 PeonyLogf("Unsupported non-relative conditional branch at %p", currentPC);
                 return false;
@@ -1022,6 +993,36 @@ bool CompileBlockTerminator(
                 return false;
             }
             if (!DbiEmitPatchableExit(Dst, targetAppPC, patchLabels))
+            {
+                return false;
+            }
+            return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+        } break;
+        case ZYDIS_CATEGORY_COND_BR:
+        {
+            assert(instr->meta.branch_type != ZYDIS_BRANCH_TYPE_FAR);
+            // for conditional branches in x64 they're, always rel32 or rel8.
+            // at this point, the progrma already has done the comparison, so rflags is ready.
+            // we need to emit the original branch jcc code, and make sure the branch target address
+            // hits the DBI again with the correct target pc
+            uintptr_t takenAddress = 0;
+            if (!GetDirectRelativeTarget(instr, operands, currentPC, &takenAddress))
+            {
+                PeonyLogf("Unsupported non-relative conditional branch at %p", currentPC);
+                return false;
+            }
+
+            if (!DbiEmitJccToLabel1(Dst, instr->mnemonic))
+            {
+                PeonyLogf("Unsupported conditional branch Jcc code at %p", currentPC);
+                return false;
+            }
+            if (!DbiEmitPatchableExit(Dst, nextSeqAppPC, patchLabels))
+            {
+                return false;
+            }
+            |1:
+            if (!DbiEmitPatchableExit(Dst, takenAddress, patchLabels))
             {
                 return false;
             }
