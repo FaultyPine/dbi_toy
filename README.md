@@ -8,7 +8,7 @@ currently supports:
 - relocating rip-relative instructions
 - emitting basic block terminators that dispatch back into the DBI
     - not all terminators are supported yet, that is the current WIP
-
+- backpatching code cache blocks
 
 goal: i consider this complete once i'm able to
 - count basic blocks executed in a program

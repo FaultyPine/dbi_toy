@@ -67,6 +67,25 @@ typedef struct
     uint8_t* value; // code cache pc
 } CodeCacheEntry;
 
+// code cache location that can & will be backpatched
+typedef struct
+{
+    uint8_t* codeCachePc;
+} ExitPatchSite;
+
+// labels placed at the exits of code cache blocks for later backpatching
+typedef struct
+{
+    uintptr_t targetAppPC;
+    int label;
+} ExitPatchLabel;
+
+typedef struct
+{
+    uintptr_t key; // target app pc
+    ExitPatchSite* value; // arr of exit sites to patch when this target is compiled
+} PendingExitPatchEntry;
+
 typedef struct
 {
     uint8_t* base;
@@ -76,6 +95,7 @@ typedef struct
 } CodeCache;
 
 static CodeCache g_codeCache;
+static PendingExitPatchEntry* g_pendingExitPatches;
 
 typedef struct
 {
@@ -455,6 +475,147 @@ uint8_t* CodeCacheLookup(uint64_t appPc)
     return entry ? entry->value : NULL;
 }
 
+static void DbiDynasmInit(dasm_State** Dst)
+{
+    dasm_init(Dst, DASM_MAXSECTION);
+    dasm_setupglobal(Dst, NULL, 0);
+    dasm_setup(Dst, peony_dynasm_actions);
+}
+
+static bool DbiDynasmEncode(dasm_State** Dst, uint8_t* out, size_t* outSize)
+{
+    size_t size = 0;
+    int status = dasm_link(Dst, &size);
+    if (status != 0)
+    {
+        PeonyLogf("DynASM link failed with status %d", status);
+        return false;
+    }
+
+    status = dasm_encode(Dst, out);
+    if (status != 0)
+    {
+        PeonyLogf("DynASM encode failed with status %d", status);
+        return false;
+    }
+
+    *outSize = size;
+    return true;
+}
+
+static void CodeCacheAddPendingPatch(uintptr_t targetAppPC, uint8_t* patchSite);
+
+static bool DbiDynasmEncodeSnippet(dasm_State** Dst, CodeCursor* cursor, ExitPatchLabel* patchLabels)
+{
+    uint8_t* base = cursor->cursor;
+    size_t size = 0;
+    if (!DbiDynasmEncode(Dst, base, &size))
+    {
+        return false;
+    }
+
+    for (int i = 0; i < arrlen(patchLabels); i++)
+    {
+        int offset = dasm_getpclabel(Dst, patchLabels[i].label);
+        if (offset < 0)
+        {
+            PeonyLogf("DynASM patch label %d was not resolved", patchLabels[i].label);
+            return false;
+        }
+        CodeCacheAddPendingPatch(patchLabels[i].targetAppPC, base + offset);
+    }
+
+    cursor->cursor += size;
+    return true;
+}
+
+static bool DbiPatchExitToDirectJump(uint8_t* patchSite, uint8_t* targetCodeCachePC)
+{
+    dasm_State* D = NULL;
+    dasm_State** Dst = &D;
+    DbiDynasmInit(Dst);
+
+    | jmp &targetCodeCachePC
+
+    size_t size = 0;
+    int status = dasm_link(Dst, &size);
+    if (status != 0)
+    {
+        PeonyLogf("DynASM link failed while patching exit: %d", status);
+        dasm_free(Dst);
+        return false;
+    }
+
+    if (size > 5)
+    {
+        PeonyLogf("Direct exit patch was unexpectedly %llu bytes", (unsigned long long)size);
+        dasm_free(Dst);
+        return false;
+    }
+
+    status = dasm_encode(Dst, patchSite);
+    dasm_free(Dst);
+    if (status != 0)
+    {
+        PeonyLogf("DynASM encode failed while patching exit: %d", status);
+        return false;
+    }
+
+    FlushInstructionCache(GetCurrentProcess(), patchSite, size);
+    return true;
+}
+
+static void CodeCacheAddPendingPatch(uintptr_t targetAppPC, uint8_t* patchSite)
+{
+    PendingExitPatchEntry* entry = g_pendingExitPatches
+        ? hmgetp_null(g_pendingExitPatches, targetAppPC)
+        : NULL;
+
+    ExitPatchSite site = {.codeCachePc = patchSite};
+    if (entry)
+    {
+        arrput(entry->value, site);
+        return;
+    }
+
+    ExitPatchSite* sites = NULL;
+    arrput(sites, site);
+    hmput(g_pendingExitPatches, targetAppPC, sites);
+}
+
+static void CodeCachePatchPendingExits(uintptr_t targetAppPC, uint8_t* targetCodeCachePC)
+{
+    if (!g_pendingExitPatches)
+    {
+        return;
+    }
+
+    PendingExitPatchEntry* entry = hmgetp_null(g_pendingExitPatches, targetAppPC);
+    if (!entry)
+    {
+        return;
+    }
+
+    ExitPatchSite* sites = entry->value;
+    for (int i = 0; i < arrlen(sites); i++)
+    {
+        if (!DbiPatchExitToDirectJump(sites[i].codeCachePc, targetCodeCachePC))
+        {
+            PeonyLogf("Failed to patch exit at %p to %p", sites[i].codeCachePc, targetCodeCachePC);
+            continue;
+        }
+    }
+
+    arrfree(sites);
+    hmdel(g_pendingExitPatches, targetAppPC);
+}
+
+static void CodeCachePublishBlock(uintptr_t appPc, uint8_t* blockStart)
+{
+    hmput(g_codeCache.entries, appPc, blockStart);
+    CodeCachePatchPendingExits(appPc, blockStart);
+}
+
 // tries to initialize code cache memory within rel32 range of 'nearPc'
 // if we can get our code cache within rel32 range, we can relocate rip-relative stuff much easier/more consistently
 // if we can't get it nearby, we still initialize, but some rip-relative stuff might be more complicated to properly jit
@@ -653,99 +814,121 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, uintptr_t appPc, Zyd
     return true;
 }
 
-bool DbiDynasmEncodeSnippet(dasm_State** Dst, CodeCursor* cursor)
-{
-    size_t size = 0;
-    int status = dasm_link(Dst, &size);
-    if (status != 0)
-    {
-        PeonyLogf("DynASM link failed with status %d", status);
-        return false;
-    }
-
-    status = dasm_encode(Dst, cursor->cursor);
-    if (status != 0)
-    {
-        PeonyLogf("DynASM encode failed with status %d", status);
-        return false;
-    }
-
-    cursor->cursor += size;
-    return true;
-}
-
 #define DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC -1
-static void DbiEmitDbiExitTrampoline(dasm_State** Dst, uintptr_t targetAppPC)
+static void DbiEmitExitTrampoline(dasm_State** Dst, uintptr_t targetAppPC)
 {
-    bool doesDispatchRegAlreadyHaveTargetPC = targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC;
-    // The code cache is allocated near app code, not necessarily near this DLL's
-    // globals, so don't use RIP-relative addressing for DBI state here.
+    bool dispatchRegHasTargetPC = targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC;
+
     | push DBI_STATE_REG
-    if (!doesDispatchRegAlreadyHaveTargetPC)
+    if (!dispatchRegHasTargetPC)
     {
         | push DBI_DISPATCH_REG
     }
+
     | mov64 DBI_STATE_REG, (uintptr_t)&g_hijackedThreadState.savedRegs.Rip
-    if (!doesDispatchRegAlreadyHaveTargetPC)
+    if (!dispatchRegHasTargetPC)
     {
         | mov64 DBI_DISPATCH_REG, targetAppPC
     }
+
     | mov qword [DBI_STATE_REG], DBI_DISPATCH_REG
-    if (!doesDispatchRegAlreadyHaveTargetPC)
+    if (!dispatchRegHasTargetPC)
     {
         | pop DBI_DISPATCH_REG
     }
+
     | pop DBI_STATE_REG
-    // Absolute indirect jump, encoded manually because DynASM doesn't accept
-    // the Intel "jmp qword ptr [rip + 0]" spelling.
-    // we do it this weird way so we don't need to clobber any registers before the jump
-    // because the exit function here will never return
-    |.byte 0xff, 0x25, 0, 0, 0, 0 // "jmp qword ptr [rip + 0]"
+    // jmp qword ptr [rip + 0]    <- this is an absolute indirect jump using a 64bit pointer embedded right after this jmp instruction
+    | jmp qword [>9]
+    |9:
     |.quad (uintptr_t)DBIExitTrampoline
 }
 
-bool DbiEmitJccToLabel1(dasm_State** Dst, ZydisMnemonic mnemonic)
+// emits a dbi exit trampoline, but also appends to a list of exit labels so we can later backpatch this
+static bool DbiEmitPatchableExit(dasm_State** Dst, uintptr_t targetAppPC, ExitPatchLabel** patchLabels)
 {
-    // crash course on dynasm labels
-    // local labels numbered 1-9, they are reusable
-    // >1 means "the next 1" and <1 means "the previous 1"
+    uint8_t* targetCodeCachePC = CodeCacheLookup(targetAppPC);
+    if (targetCodeCachePC)
+    {
+        | jmp &targetCodeCachePC
+        return true;
+    }
 
-    // i added a couple common ones, but if we hit one that isn't here, this is the list of em all
-    // https://www.felixcloutier.com/x86/jcc
+    int label = arrlen(*patchLabels);
+    dasm_growpc(Dst, label + 1);
+
+    ExitPatchLabel patchLabel = {.targetAppPC = targetAppPC, .label = label};
+    arrput(*patchLabels, patchLabel);
+
+    |=>label:
+    // the bytes here (emitted in the below function) are what gets backpatched
+    DbiEmitExitTrampoline(Dst, targetAppPC);
+    return true;
+}
+
+static void DbiEmitPushReturnAddress(dasm_State** Dst, uintptr_t returnAppPC)
+{
+    | push DBI_DISPATCH_REG
+    | mov64 DBI_DISPATCH_REG, returnAppPC
+    | xchg qword [rsp], DBI_DISPATCH_REG
+}
+
+static void DbiEmitPopDispatchReg(dasm_State** Dst)
+{
+    | pop DBI_DISPATCH_REG
+}
+
+static bool DbiEmitJccToLabel1(dasm_State** Dst, ZydisMnemonic mnemonic)
+{
     switch (mnemonic)
     {
-        case ZYDIS_MNEMONIC_JZ:   
-        | jz >1; 
+        case ZYDIS_MNEMONIC_JO:
+        | jo >1
         return true;
-        case ZYDIS_MNEMONIC_JNZ:  
-        | jnz >1; 
+        case ZYDIS_MNEMONIC_JNO:
+        | jno >1
         return true;
-        case ZYDIS_MNEMONIC_JB:   
-        | jb >1; 
+        case ZYDIS_MNEMONIC_JB:
+        | jb >1
         return true;
-        case ZYDIS_MNEMONIC_JNB:  
-        | jnb >1; 
+        case ZYDIS_MNEMONIC_JNB:
+        | jnb >1
         return true;
-        case ZYDIS_MNEMONIC_JBE:  
-        | jbe >1; 
+        case ZYDIS_MNEMONIC_JZ:
+        | jz >1
         return true;
-        case ZYDIS_MNEMONIC_JNBE: 
-        | jnbe >1; 
+        case ZYDIS_MNEMONIC_JNZ:
+        | jnz >1
         return true;
-        case ZYDIS_MNEMONIC_JL:   
-        | jl >1; 
+        case ZYDIS_MNEMONIC_JBE:
+        | jbe >1
         return true;
-        case ZYDIS_MNEMONIC_JNL:  
-        | jnl >1; 
+        case ZYDIS_MNEMONIC_JNBE:
+        | jnbe >1
         return true;
-        case ZYDIS_MNEMONIC_JLE:  
-        | jle >1; 
+        case ZYDIS_MNEMONIC_JS:
+        | js >1
         return true;
-        case ZYDIS_MNEMONIC_JNLE: 
-        | jnle >1; 
+        case ZYDIS_MNEMONIC_JNS:
+        | jns >1
         return true;
-        case ZYDIS_MNEMONIC_JO:   
-        | jo >1; 
+        case ZYDIS_MNEMONIC_JP:
+        | jp >1
+        return true;
+        case ZYDIS_MNEMONIC_JNP:
+        | jnp >1
+        return true;
+        case ZYDIS_MNEMONIC_JL:
+        | jl >1
+        return true;
+        case ZYDIS_MNEMONIC_JNL:
+        | jnl >1
+        return true;
+        case ZYDIS_MNEMONIC_JLE:
+        | jle >1
+        return true;
+        case ZYDIS_MNEMONIC_JNLE:
+        | jnle >1
         return true;
         default:
             return false;
@@ -757,7 +940,8 @@ bool CompileBlockTerminator(
     uintptr_t currentPC, 
     ZydisDecodedInstruction* instr, 
     ZydisDecodedOperand* operands,
-    dasm_State** Dst)
+    dasm_State** Dst,
+    ExitPatchLabel** patchLabels)
 {
     // the PC after this terminator instruction
     // also used as the "fallthrough" PC when we decide a branch shouldn't be taken
@@ -788,8 +972,11 @@ bool CompileBlockTerminator(
                 PeonyLogf("Unsupported indirect unconditional branch at %p", (void*)currentPC);
                 return false;
             }
-            DbiEmitDbiExitTrampoline(Dst, targetAppPC);
-            return DbiDynasmEncodeSnippet(Dst, cursor); 
+            if (!DbiEmitPatchableExit(Dst, targetAppPC, patchLabels))
+            {
+                return false;
+            }
+            return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
         } break;
         case ZYDIS_CATEGORY_COND_BR:
         {
@@ -804,15 +991,22 @@ bool CompileBlockTerminator(
                 PeonyLogf("Unsupported non-relative conditional branch at %p", currentPC);
                 return false;
             }
+
             if (!DbiEmitJccToLabel1(Dst, instr->mnemonic))
             {
                 PeonyLogf("Unsupported conditional branch Jcc code at %p", currentPC);
                 return false;
             }
-            DbiEmitDbiExitTrampoline(Dst, nextSeqAppPC);
+            if (!DbiEmitPatchableExit(Dst, nextSeqAppPC, patchLabels))
+            {
+                return false;
+            }
             |1:
-            DbiEmitDbiExitTrampoline(Dst, takenAddress);
-            return DbiDynasmEncodeSnippet(Dst, cursor); 
+            if (!DbiEmitPatchableExit(Dst, takenAddress, patchLabels))
+            {
+                return false;
+            }
+            return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
         } break;
         case ZYDIS_CATEGORY_CALL:
         {
@@ -826,18 +1020,18 @@ bool CompileBlockTerminator(
             // we will be returning to this current (really, next) pc
             // we dont want to clobber regs here, so we use this xchg trick on the stack 
             // to make sure DBI_DISPATCH_REG is the same as before, and top of the stack has the return address (nextSeqAppPC)
-            | push DBI_DISPATCH_REG
-            | mov64 DBI_DISPATCH_REG, nextSeqAppPC
-            // swap the content of memory & register w/o needing a temp
-            | xchg qword [rsp], DBI_DISPATCH_REG
-            DbiEmitDbiExitTrampoline(Dst, targetAddress);
-            return DbiDynasmEncodeSnippet(Dst, cursor); 
+            DbiEmitPushReturnAddress(Dst, nextSeqAppPC);
+            if (!DbiEmitPatchableExit(Dst, targetAddress, patchLabels))
+            {
+                return false;
+            }
+            return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
         } break;
         case ZYDIS_CATEGORY_RET:
         {
-            | pop DBI_DISPATCH_REG
-            DbiEmitDbiExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
-            return DbiDynasmEncodeSnippet(Dst, cursor); 
+            DbiEmitPopDispatchReg(Dst);
+            DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
+            return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
         } break;
         case ZYDIS_CATEGORY_SYSCALL:
         {
@@ -846,8 +1040,11 @@ bool CompileBlockTerminator(
                 PeonyLogf("Something went wrong emitting instructions for syscall/sysret");
                 return false;
             }
-            DbiEmitDbiExitTrampoline(Dst, nextSeqAppPC);
-            return DbiDynasmEncodeSnippet(Dst, cursor); 
+            if (!DbiEmitPatchableExit(Dst, nextSeqAppPC, patchLabels))
+            {
+                return false;
+            }
+            return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
         } break;
         default:
         {
@@ -869,10 +1066,9 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
 {
     dasm_State* D = NULL;
     dasm_State** Dst = &D;
-    dasm_init(Dst, DASM_MAXSECTION);
-    dasm_setupglobal(Dst, NULL, 0);
-    dasm_setup(Dst, peony_dynasm_actions);
-    
+    DbiDynasmInit(Dst);
+    ExitPatchLabel* patchLabels = NULL;
+
     if (!CodeCacheInit(appPc))
     {
         goto error;
@@ -926,7 +1122,7 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
         // for these, we need to emit some special code that 
         if (IsBasicBlockTerminator(&instr))
         {
-            if (!CompileBlockTerminator(&codeOut, currentPC, &instr, operands, Dst))
+            if (!CompileBlockTerminator(&codeOut, currentPC, &instr, operands, Dst, &patchLabels))
             {
                 LogDecodedInstructionRange("Terminator that failed to compile", &decoder, &fmt, currentPC, instr.length);
                 goto error;
@@ -945,7 +1141,7 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
 
     FlushInstructionCache(GetCurrentProcess(), blockStart, codeOut.cursor - blockStart);
 
-    hmput(g_codeCache.entries, appPc, blockStart);
+    CodeCachePublishBlock(appPc, blockStart);
     
 #if DBI_LOG_COMPILATION_VERBOSE
     LogCompiledBasicBlockComparison(&decoder, &fmt, appPc, currentPC, blockStart, codeOut.cursor);
@@ -953,10 +1149,12 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
     PeonyLogf("There are now %llu entries in the code cache", (unsigned long long)hmlenu(g_codeCache.entries));
 
     // return the code cache, so now the program will be executing in our instrumented code
+    arrfree(patchLabels);
     dasm_free(Dst);
     return (uint8_t*)blockStart;
 
 error:
+    arrfree(patchLabels);
     dasm_free(Dst);
     return (uint8_t*)appPc;
 }
