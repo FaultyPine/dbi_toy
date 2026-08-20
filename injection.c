@@ -951,33 +951,6 @@ bool CompileBlockTerminator(
     {
         // BOOKMARK: still need to support memory targets, rip-relative memory targets, register targets
         //      for both uncond br and call
-        case ZYDIS_CATEGORY_UNCOND_BR:
-        {
-            assert(instr->meta.branch_type != ZYDIS_BRANCH_TYPE_FAR); // NYI
-
-            uintptr_t targetAppPC = nextSeqAppPC;
-            // EX: jmp 0xDEADBEEF
-            if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
-            {
-                ZyanU64 absoluteTarget = 0;
-                if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &absoluteTarget)))
-                {
-                    PeonyLogf("Failed to resolve direct branch target at %p", (void*)currentPC);
-                    return false;
-                }
-                targetAppPC = (uintptr_t)absoluteTarget;
-            }
-            else
-            {
-                PeonyLogf("Unsupported indirect unconditional branch at %p", (void*)currentPC);
-                return false;
-            }
-            if (!DbiEmitPatchableExit(Dst, targetAppPC, patchLabels))
-            {
-                return false;
-            }
-            return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
-        } break;
         case ZYDIS_CATEGORY_COND_BR:
         {
             assert(instr->meta.branch_type != ZYDIS_BRANCH_TYPE_FAR);
@@ -1022,6 +995,33 @@ bool CompileBlockTerminator(
             // to make sure DBI_DISPATCH_REG is the same as before, and top of the stack has the return address (nextSeqAppPC)
             DbiEmitPushReturnAddress(Dst, nextSeqAppPC);
             if (!DbiEmitPatchableExit(Dst, targetAddress, patchLabels))
+            {
+                return false;
+            }
+            return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+        } break;
+        case ZYDIS_CATEGORY_UNCOND_BR:
+        {
+            assert(instr->meta.branch_type != ZYDIS_BRANCH_TYPE_FAR); // NYI
+
+            uintptr_t targetAppPC = nextSeqAppPC;
+            // EX: jmp 0xDEADBEEF
+            if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
+            {
+                ZyanU64 absoluteTarget = 0;
+                if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &absoluteTarget)))
+                {
+                    PeonyLogf("Failed to resolve direct branch target at %p", (void*)currentPC);
+                    return false;
+                }
+                targetAppPC = (uintptr_t)absoluteTarget;
+            }
+            else
+            {
+                PeonyLogf("Unsupported indirect unconditional branch at %p", (void*)currentPC);
+                return false;
+            }
+            if (!DbiEmitPatchableExit(Dst, targetAppPC, patchLabels))
             {
                 return false;
             }
