@@ -115,6 +115,7 @@ static SharedLogObject* g_sharedLog;
 
 // Stay in signed rel32 +/- 2 GB range when searching for nearby code-cache memory
 static const uintptr_t DBI_CODE_CACHE_NEAR_SEARCH_RADIUS = 0x70000000ULL;
+#define DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC -1
 
 void Initialize();
 DWORD WINAPI InitializeThread(LPVOID param);
@@ -467,7 +468,7 @@ static bool IsBasicBlockTerminator(const ZydisDecodedInstruction* instr)
 
 uint8_t* CodeCacheLookup(uint64_t appPc)
 {
-    if (!g_codeCache.entries)
+    if (!g_codeCache.entries || appPc == DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC)
     {
         return NULL;
     }
@@ -583,14 +584,14 @@ static void CodeCacheAddPendingPatch(uintptr_t targetAppPC, uint8_t* patchSite)
     hmput(g_pendingExitPatches, targetAppPC, sites);
 }
 
-static void CodeCachePatchPendingExits(uintptr_t targetAppPC, uint8_t* targetCodeCachePC)
+static void CodeCachePatchPendingExits(uintptr_t blockStartPC, uint8_t* targetCodeCachePC)
 {
     if (!g_pendingExitPatches)
     {
         return;
     }
 
-    PendingExitPatchEntry* entry = hmgetp_null(g_pendingExitPatches, targetAppPC);
+    PendingExitPatchEntry* entry = hmgetp_null(g_pendingExitPatches, blockStartPC);
     if (!entry)
     {
         return;
@@ -607,7 +608,7 @@ static void CodeCachePatchPendingExits(uintptr_t targetAppPC, uint8_t* targetCod
     }
 
     arrfree(sites);
-    hmdel(g_pendingExitPatches, targetAppPC);
+    hmdel(g_pendingExitPatches, blockStartPC);
 }
 
 static void CodeCachePublishBlock(uintptr_t appPc, uint8_t* blockStart)
@@ -815,7 +816,6 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, uintptr_t appPc, Zyd
     return true;
 }
 
-#define DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC -1
 static void DbiEmitExitTrampoline(dasm_State** Dst, uintptr_t targetAppPC)
 {
     bool dispatchRegHasTargetPC = targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC;
@@ -833,12 +833,21 @@ static void DbiEmitExitTrampoline(dasm_State** Dst, uintptr_t targetAppPC)
     }
 
     | mov qword [DBI_STATE_REG], DBI_DISPATCH_REG
+    
     if (!dispatchRegHasTargetPC)
     {
         | pop DBI_DISPATCH_REG
     }
-
+    
     | pop DBI_STATE_REG
+    
+    // NOTE: even if the dispatch reg had the target pc coming into this function, we still pop it because we assume the caller had
+    // saved the original dispatch reg content on the stack
+    if (dispatchRegHasTargetPC)
+    {
+        | pop DBI_DISPATCH_REG
+    }
+
     // jmp qword ptr [rip + 0]    <- this is an absolute indirect jump using a 64bit pointer embedded right after this jmp instruction
     | jmp qword [>9]
     |9:
@@ -867,16 +876,11 @@ static bool DbiEmitPatchableExit(dasm_State** Dst, uintptr_t targetAppPC, ExitPa
     return true;
 }
 
-static void DbiEmitPushReturnAddress(dasm_State** Dst, uintptr_t returnAppPC)
+static void DbiEmitPush(dasm_State** Dst, uintptr_t returnAppPC)
 {
     | push DBI_DISPATCH_REG
     | mov64 DBI_DISPATCH_REG, returnAppPC
     | xchg qword [rsp], DBI_DISPATCH_REG
-}
-
-static void DbiEmitPopDispatchReg(dasm_State** Dst)
-{
-    | pop DBI_DISPATCH_REG
 }
 
 static bool DbiEmitJccToLabel1(dasm_State** Dst, ZydisMnemonic mnemonic)
@@ -964,7 +968,7 @@ bool CompileBlockTerminator(
             // we will be returning to this current (really, next) pc
             // we dont want to clobber regs here, so we use this xchg trick on the stack 
             // to make sure DBI_DISPATCH_REG is the same as before, and top of the stack has the return address (nextSeqAppPC)
-            DbiEmitPushReturnAddress(Dst, nextSeqAppPC);
+            DbiEmitPush(Dst, nextSeqAppPC);
             if (!DbiEmitPatchableExit(Dst, targetAddress, patchLabels))
             {
                 return false;
@@ -976,7 +980,7 @@ bool CompileBlockTerminator(
             assert(instr->meta.branch_type != ZYDIS_BRANCH_TYPE_FAR); // NYI
 
             uintptr_t targetAppPC = nextSeqAppPC;
-            // EX: jmp 0xDEADBEEF
+            // immediate jmp EX: jmp 0xDEADBEEF
             if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
             {
                 ZyanU64 absoluteTarget = 0;
@@ -986,6 +990,23 @@ bool CompileBlockTerminator(
                     return false;
                 }
                 targetAppPC = (uintptr_t)absoluteTarget;
+            }
+            // static memory indirect jmp EX: "jmp [0x00007FF6327770A8]"
+            else if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
+            {
+                ZyanU64 jmpMemAddress = 0; // ^  this is the absolute address of the memory that contains the address we should jump to
+                if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &jmpMemAddress)))
+                {
+                    PeonyLogf("Failed to resolve direct branch target at %p", (void*)currentPC);
+                    return false;
+                }
+                PeonyLogf("memory uncondbr jmpMemAddress = %p  nextSeqAppPC = %p currentPC = %p", jmpMemAddress, nextSeqAppPC, currentPC);
+                // the emitexit call will always pop dispatch_reg back
+                | push DBI_DISPATCH_REG
+                | mov64 DBI_DISPATCH_REG, jmpMemAddress
+                | mov DBI_DISPATCH_REG, qword [DBI_DISPATCH_REG]
+                DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
+                return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
             else
             {
@@ -1030,7 +1051,8 @@ bool CompileBlockTerminator(
         } break;
         case ZYDIS_CATEGORY_RET:
         {
-            DbiEmitPopDispatchReg(Dst);
+            // save the original dispatch reg on the stack, the emitexit function will always pop this back into dispatch_reg
+            | xchg qword [rsp], DBI_DISPATCH_REG
             DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
             return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
         } break;
