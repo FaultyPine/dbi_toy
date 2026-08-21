@@ -7,8 +7,7 @@ set "BUILD=%ROOT%\build"
 
 if "%~1"=="" (
     goto :testerRun
-)
-else (
+) else (
     "%BUILD%/main.exe" %*
     if errorlevel 1 goto :fail
     goto :success

@@ -12,7 +12,7 @@
 char* sharedCommsMappingName = "Peony_SharedMapping";
 char* sharedLogMappingName = "Peony_LogMapping";
 
-#define PEONY_LOG_BUFFER_SIZE (1 * MB)
+#define PEONY_LOG_BUFFER_SIZE (10 * MB)
 
 typedef struct 
 {
@@ -24,6 +24,8 @@ typedef struct
     volatile LONG writeOffset;
     volatile LONG readOffset;
     volatile LONG droppedBytes;
+
+    // must be last
     char buffer[PEONY_LOG_BUFFER_SIZE];
 } SharedLogObject;
 

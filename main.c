@@ -303,13 +303,18 @@ int main(int argc, char** argv)
     SharedLogObject* sharedLog = SharedLogInitialize();
     if (sharedLog)
     {
-        *sharedLog = (SharedLogObject){0};
+        // SharedLogObject might hold a large buffer, so using a zero-assignment here can cause a stack overflow so we just 0 out the non-buffer members
+        memset(sharedLog, 0, offsetof(SharedLogObject, buffer));
         g_logPumpState.log = sharedLog;
         g_logPumpState.stopEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
         if (g_logPumpState.stopEvent)
         {
             logPumpThread = CreateThread(NULL, 0, InjectedLogPumpThread, &g_logPumpState, 0, NULL);
         }
+    }
+    else
+    {
+        printf("Control process failed to created shared log object");
     }
 #endif
 
