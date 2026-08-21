@@ -102,7 +102,7 @@ typedef struct
     uint8_t* cursor;
 } CodeCursor;
 
-#define DBI_CODE_CACHE_SIZE (1024 * 1024)
+#define DBI_CODE_CACHE_SIZE (50 * MB)
 #define DBI_LOG_COMPILATION_VERBOSE 1
 
 static ThreadHijackState g_hijackedThreadState;

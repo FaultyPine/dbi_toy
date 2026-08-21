@@ -12,7 +12,7 @@
 char* sharedCommsMappingName = "Peony_SharedMapping";
 char* sharedLogMappingName = "Peony_LogMapping";
 
-#define PEONY_LOG_BUFFER_SIZE (64 * 1024)
+#define PEONY_LOG_BUFFER_SIZE (1 * MB)
 
 typedef struct 
 {
