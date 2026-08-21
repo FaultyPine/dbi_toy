@@ -1005,6 +1005,7 @@ bool CompileBlockTerminator(
                 | push DBI_DISPATCH_REG
                 | mov64 DBI_DISPATCH_REG, jmpMemAddress
                 | mov DBI_DISPATCH_REG, qword [DBI_DISPATCH_REG]
+                // TODO: this is not currently backpatchable, but getting indirect jumps to be backpatchable is complicated.
                 DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
                 return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
