@@ -45,3 +45,48 @@ and we populate those 8 bytes with what we think it'll be, then we emit a cmp to
 If it's not the cached one, we need to do the slow exit.
 
 
+One thing i was told about is if you're wanting to do some instrumentation is DBI engines will "reserve" some cpu reigsters for themselves.
+I.E. you reserve r15 to always hold a pointer to some per-thread state context struct. And maybe r14 for "scratch" work.
+Then whenever the real program tries to use the registers you've "reserved", you instead redirect them to "virtual" registers you store in the per-thread ctx.
+So like if you reserve r15 as the thread context ptr...
+```
+add rax, r15
+```
+becomes
+```
+add rax, [r15 + guest_r15_offset]
+```
+A problem arises when you need more temp/scratch storage...
+Imagine you've reserved r15 as threadctx ptr, and r14 as your own perma scratch reg.
+So all ops with r15 and r14 must go through "virtual" regs.
+Then
+```
+add r14, r15
+```
+is an issue because we need some scratch storage to handle it.
+One way to solve it is to have some scratch storage on your thread ctx ptr and save/restore the scratch regs... 
+so we map
+r14 => rax
+r15 => rbx
+so now rax and rbc are our scratch regs that represent the real r14 and r15
+so we emit
+```
+// save real rax/rbc off
+mov [r14 + slot1], rax
+mov [r14 + slot2], rbx
+// load rax/rbx up with the real r14/15
+mov rax, [r14 + r14_offset]
+mov rbx, [r14 + r15_offset]
+// actual op
+add rax, rbx
+// save result of the op into virtual regs
+mov [r14 + r14_offset], rax
+mov [r14 + r15_offset], rbx
+// restore our scratch regs
+mov rax, [r14 + slot1]
+mov rbx, [r14 + slot2]
+```
+
+^ is a simple and slower way of doing it.
+A more complex but faster way is to do real dataflow analysis of live/dead registers, to decide which ones are available for scratch work and use those.
+"A guest register is live at a point if its current value may be read later before being overwritten." If <- is not the case, the reg is "dead" and we can just use it as scratch.
