@@ -1,4 +1,6 @@
 
+Only for x64 windows.
+Building: run `build.bat`
 
 trying to learn how to write a DBI engine
 

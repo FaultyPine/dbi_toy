@@ -31,3 +31,17 @@ zydis points out in their readme that this is a nice zydis wrapper (but uses c++
 
 I should use this!  https://github.com/LuaJIT/LuaJIT/tree/v2.1/dynasm
                 really clever C machine code emitter where you can kinda put emit inline assembly directly inside C
+
+
+
+Simple way to keep control of a thread in a DBI is to emit "exits" that still jump into our code cache.
+a simple "exit" there means saving all registers, branching to our C code, doing a code cache lookup (or compile, if it's not cached), restoring registers, and jumping to that code cache.
+But that's slow, so we implement "backpatching". Instead of doing the register save + C call + restore + jump. Once we know we have a code cache block compiled for the target address of the jump,
+we patch the exit to jump directly to our known existing code cache block. 
+
+Though the above becomes a little more complex with indirect jumps/calls. Because those rely on runtime memory addresses rather than static ones we see in the code.
+For those, i've heard a little "inline" cache of the previous jump is good. I.E. the jump instruction jumps to the value of the next 8 bytes after the jump instruction (rip-relative)
+and we populate those 8 bytes with what we think it'll be, then we emit a cmp to see if the target address of the actual code matches our cached codecache address, and if so we just go there.
+If it's not the cached one, we need to do the slow exit.
+
+
