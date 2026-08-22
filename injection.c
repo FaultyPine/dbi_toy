@@ -22,7 +22,6 @@
 #define STB_DS_IMPLEMENTATION
 #include "external/std_ds.h"
 #include "shared_defines.h"
-#include "emit_x64.h"
 
 #define PEONY_SHARED_COMMS_IMPLEMENTATION
 #include "shared_comms.h"
@@ -161,6 +160,13 @@ static bool IsRel32Reachable(uintptr_t fromNextRip, uintptr_t target)
 {
     int64_t delta = (int64_t)(target - fromNextRip);
     return delta >= INT32_MIN && delta <= INT32_MAX;
+}
+
+static bool X64EmitBytes(uint8_t** out, const void* bytes, size_t length)
+{
+    memcpy(*out, bytes, length);
+    *out += length;
+    return true;
 }
 
 void PeonyLogWrite(const char* bytes, int length)
