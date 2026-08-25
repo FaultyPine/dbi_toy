@@ -88,7 +88,7 @@ typedef struct
 
 typedef struct
 {
-    uint8_t* base;
+    void* base;
     size_t capacity;
     size_t used;
     CodeCacheEntry* entries; // hm: app PC -> code-cache PC
@@ -102,7 +102,7 @@ typedef struct
     uint8_t* cursor;
 } CodeCursor;
 
-#define DBI_CODE_CACHE_SIZE (50 * MB)
+#define DBI_CODE_CACHE_SIZE (5 * MB)
 #define DBI_LOG_COMPILATION_VERBOSE 1
 
 static ThreadHijackState g_hijackedThreadState;
@@ -692,7 +692,7 @@ bool CodeCacheInit(uintptr_t nearPc)
     }
     g_codeCache.capacity = DBI_CODE_CACHE_SIZE;
     g_codeCache.used = 0;
-    PeonyLogf("Code cache allocated at %p, but not necessarily near %p", g_codeCache.base, (void*)nearPc);
+    PeonyLogf("Code cache allocated at arbitrary address %p. Not necessarily near %p. This will hurt the performance of the instrumented program.", g_codeCache.base, (void*)nearPc);
     return true;
 }
 

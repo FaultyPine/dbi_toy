@@ -10,3 +10,4 @@ external/zydis/build
 .vscode
 .vs
 *.rdi
+*Log.txt

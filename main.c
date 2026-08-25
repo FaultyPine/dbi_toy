@@ -21,6 +21,7 @@
 // then this main process can pump those logs to it's own stdout 
 // so we can essentially log from the external injected process
 #define PEONY_PUMP_INJECTED_LOGS 1
+#define PEONY_LOG_FILE_CHUNK_SIZE (10 * MB)
 
 typedef struct 
 {
@@ -34,6 +35,11 @@ GlobalState g_state;
 typedef struct
 {
     SharedLogObject* log;
+    HANDLE logFile;
+    HANDLE logFileMapping;
+    void* logFileMem;
+    uint64_t logFileCapacity;
+    uint64_t logFileOffset;
     HANDLE stopEvent;
 } LogPumpState;
 
@@ -50,8 +56,120 @@ const char* EatChars(const char* str, const char* sub)
     return str;
 }
 
-void DrainInjectedLogsToStdout(SharedLogObject* log)
+bool EnsureMappedLogFileCapacity(LogPumpState* state, uint64_t bytesNeeded)
 {
+    if (!state->logFile || state->logFile == INVALID_HANDLE_VALUE)
+    {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    if (bytesNeeded > UINT64_MAX - state->logFileOffset)
+    {
+        SetLastError(ERROR_FILE_TOO_LARGE);
+        return false;
+    }
+
+    uint64_t requiredCapacity = state->logFileOffset + bytesNeeded;
+    if (requiredCapacity <= state->logFileCapacity)
+    {
+        return true;
+    }
+
+    uint64_t newCapacity = state->logFileCapacity;
+    if (newCapacity == 0)
+    {
+        newCapacity = PEONY_LOG_FILE_CHUNK_SIZE;
+    }
+    while (newCapacity < requiredCapacity)
+    {
+        if (newCapacity > UINT64_MAX - PEONY_LOG_FILE_CHUNK_SIZE)
+        {
+            SetLastError(ERROR_FILE_TOO_LARGE);
+            return false;
+        }
+        newCapacity += PEONY_LOG_FILE_CHUNK_SIZE;
+    }
+
+    if (state->logFileMem)
+    {
+        FlushViewOfFile(state->logFileMem, (SIZE_T)state->logFileOffset);
+    }
+
+    HANDLE newMapping = CreateFileMapping(
+        state->logFile,
+        NULL,
+        PAGE_READWRITE,
+        (DWORD)(newCapacity >> 32),
+        (DWORD)(newCapacity & 0xFFFFFFFFu),
+        NULL
+    );
+    if (newMapping == NULL)
+    {
+        return false;
+    }
+
+    void* newMem = MapViewOfFile(
+        newMapping,
+        FILE_MAP_ALL_ACCESS,
+        0, 0,
+        (SIZE_T)newCapacity
+    );
+    if (newMem == NULL)
+    {
+        DWORD error = GetLastError();
+        CloseHandle(newMapping);
+        SetLastError(error);
+        return false;
+    }
+
+    if (state->logFileMem)
+    {
+        UnmapViewOfFile(state->logFileMem);
+    }
+    if (state->logFileMapping)
+    {
+        CloseHandle(state->logFileMapping);
+    }
+
+    state->logFileMapping = newMapping;
+    state->logFileMem = newMem;
+    state->logFileCapacity = newCapacity;
+    return true;
+}
+
+void WriteMappedLogFileChunk(LogPumpState* state, const void* bytes, DWORD length)
+{
+    if (!state->logFileMem || length == 0)
+    {
+        return;
+    }
+
+    DWORD bytesToWrite = length;
+    if (!EnsureMappedLogFileCapacity(state, length))
+    {
+        DWORD error = GetLastError();
+        printf("[main] Failed to grow injected log file mapping (%lu); log bytes may be dropped.\n", error);
+
+        uint64_t remaining = (state->logFileOffset < state->logFileCapacity)
+            ? (state->logFileCapacity - state->logFileOffset)
+            : 0;
+        if ((uint64_t)bytesToWrite > remaining)
+        {
+            bytesToWrite = (DWORD)remaining;
+        }
+    }
+
+    if (bytesToWrite > 0)
+    {
+        memcpy((uint8_t*)state->logFileMem + state->logFileOffset, bytes, bytesToWrite);
+        state->logFileOffset += bytesToWrite;
+    }
+}
+
+void DrainInjectedLogs(LogPumpState* state)
+{
+    SharedLogObject* log = state->log;
     if (!log)
     {
         return;
@@ -77,6 +195,7 @@ void DrainInjectedLogsToStdout(SharedLogObject* log)
             ? (writeOffset - readOffset)
             : (PEONY_LOG_BUFFER_SIZE - readOffset);
         fwrite(log->buffer + readOffset, 1, available, stdout);
+        WriteMappedLogFileChunk(state, log->buffer + readOffset, (DWORD)available);
 
         InterlockedExchange(&log->readOffset, (readOffset + available) % PEONY_LOG_BUFFER_SIZE);
     }
@@ -93,13 +212,13 @@ DWORD WINAPI InjectedLogPumpThread(LPVOID param)
     LogPumpState* state = (LogPumpState*)param;
     for (;;)
     {
-        DrainInjectedLogsToStdout(state->log);
+        DrainInjectedLogs(state);
         if (WaitForSingleObject(state->stopEvent, 50) == WAIT_OBJECT_0)
         {
             break;
         }
     }
-    DrainInjectedLogsToStdout(state->log);
+    DrainInjectedLogs(state);
     return 0;
 }
 
@@ -305,7 +424,26 @@ int main(int argc, char** argv)
     {
         // SharedLogObject might hold a large buffer, so using a zero-assignment here can cause a stack overflow so we just 0 out the non-buffer members
         memset(sharedLog, 0, offsetof(SharedLogObject, buffer));
+
+        strncpy_s(sharedLog->outputLogFilename, sizeof(sharedLog->outputLogFilename), "PeonyLog.txt", sizeof(sharedLog->outputLogFilename));
+        HANDLE logFile = CreateFile(sharedLog->outputLogFilename, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (logFile == INVALID_HANDLE_VALUE)
+        {
+            printf("CreateFile for logfile failed (%lu).\n", GetLastError());
+            return 0;
+        }
+
         g_logPumpState.log = sharedLog;
+        g_logPumpState.logFile = logFile;
+        g_logPumpState.logFileOffset = 0;
+        if (!EnsureMappedLogFileCapacity(&g_logPumpState, PEONY_LOG_FILE_CHUNK_SIZE))
+        {
+            printf("Initial logfile mapping failed (%lu).\n", GetLastError());
+            CloseHandle(logFile);
+            memset(&g_logPumpState, 0, sizeof(g_logPumpState));
+            return 0;
+        }
+
         g_logPumpState.stopEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
         if (g_logPumpState.stopEvent)
         {
@@ -351,6 +489,26 @@ cleanup:
     if (g_logPumpState.stopEvent)
     {
         CloseHandle(g_logPumpState.stopEvent);
+    }
+    if (g_logPumpState.logFileMem)
+    {
+        FlushViewOfFile(g_logPumpState.logFileMem, (SIZE_T)g_logPumpState.logFileOffset);
+        UnmapViewOfFile(g_logPumpState.logFileMem);
+    }
+    if (g_logPumpState.logFileMapping)
+    {
+        CloseHandle(g_logPumpState.logFileMapping);
+    }
+    if (g_logPumpState.logFile && g_logPumpState.logFile != INVALID_HANDLE_VALUE)
+    {
+        LARGE_INTEGER endOfLog = {0};
+        endOfLog.QuadPart = g_logPumpState.logFileOffset;
+        if (SetFilePointerEx(g_logPumpState.logFile, endOfLog, NULL, FILE_BEGIN))
+        {
+            SetEndOfFile(g_logPumpState.logFile);
+        }
+        FlushFileBuffers(g_logPumpState.logFile);
+        CloseHandle(g_logPumpState.logFile);
     }
 
     if (remoteProcInfo.remoteThreadHdl)

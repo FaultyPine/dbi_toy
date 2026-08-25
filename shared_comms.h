@@ -24,6 +24,9 @@ typedef struct
     volatile LONG writeOffset;
     volatile LONG readOffset;
     volatile LONG droppedBytes;
+    char outputLogFilename[MAX_PATH];
+    HANDLE logFile;
+    void* logFileMem;
 
     // must be last
     char buffer[PEONY_LOG_BUFFER_SIZE];
@@ -108,7 +111,9 @@ SharedLogObject* SharedLogInitialize()
         CloseHandle(filemapping);
         return 0;
     }
-    return (SharedLogObject*)sharedMem;
+    
+    SharedLogObject* sharedLog = (SharedLogObject*)sharedMem;
+    return sharedLog;
 }
 
 #endif
