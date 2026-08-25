@@ -802,8 +802,8 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, uintptr_t appPc, Zyd
         // from the code cache rip, can i still address the original memory target via rel32?
         if (!IsRel32Reachable(newCodeCacheNextRip, (uintptr_t)absoluteTarget))
         {
-            PeonyLogf("Relocated RIP-relative target is not within rel32 range! What the heck do we do???\n");
-            assert(false && "If we hit this, the program would crash/break. There's probably a way to handle this case with some extra instrumentation");
+            PeonyLogf("Relocated RIP-relative target is not within rel32 range! What the heck do we do??? codeCacheNextRip = %p  absoluteTarget = %p\n", newCodeCacheNextRip, absoluteTarget);
+            // If we hit this, the program would crash/break. There's probably a way to handle this case with some extra instrumentation"
             return false;
         }
         // rel32 is enough to address the original memory, so we can just do the simple math and reassign the rip-relative part of the operand
@@ -965,11 +965,9 @@ bool CompileBlockTerminator(
         case ZYDIS_CATEGORY_CALL:
         {
             uintptr_t targetAddress = 0;
-            if (!GetDirectRelativeTarget(instr, operands, currentPC, &targetAddress))
+            // direct call EX: "call 0x00007FF6327770A8"
+            if (GetDirectRelativeTarget(instr, operands, currentPC, &targetAddress))
             {
-                PeonyLogf("Unsupported non-relative conditional branch at %p", currentPC);
-                return false;
-            }
             // we push the "return" address on the stack.
             // we will be returning to this current (really, next) pc
             // we dont want to clobber regs here, so we use this xchg trick on the stack 
@@ -980,6 +978,29 @@ bool CompileBlockTerminator(
                 return false;
             }
             return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+            }
+            // static memory indirect call EX: "call [0x00007FF6327770A8]"
+            else if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY && instr->meta.branch_type != ZYDIS_BRANCH_TYPE_FAR)
+            {
+                ZyanU64 jmpMemAddress = 0; // ^  this is the absolute address of the memory that contains the address we should jump to
+                if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &jmpMemAddress)))
+                {
+                    PeonyLogf("Failed to resolve direct branch target at %p", (void*)currentPC);
+                    return false;
+                }
+                PeonyLogf("memory call jmpMemAddress = %p  nextSeqAppPC = %p currentPC = %p", jmpMemAddress, nextSeqAppPC, currentPC);
+                DbiEmitPush(Dst, nextSeqAppPC);
+
+                // the emitexit call will always pop dispatch_reg back
+                | push DBI_DISPATCH_REG
+                | mov64 DBI_DISPATCH_REG, jmpMemAddress
+                | mov DBI_DISPATCH_REG, qword [DBI_DISPATCH_REG]
+                
+                // TODO: this is not currently backpatchable, but getting indirect jumps to be backpatchable is complicated.
+                DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
+                return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+            }
+            return false;
         } break;
         case ZYDIS_CATEGORY_UNCOND_BR:
         {
@@ -1163,7 +1184,7 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
 
         if (!EmitAndPossiblyRelocateInstruction(&codeOut, currentPC, &instr, operands))
         {
-            PeonyLogf("failed to emit/relocate instruction at %p", (void*)currentPC);
+            LogDecodedInstructionRange("failed to emit/relocate instruction", &decoder, &fmt, currentPC, instr.length);
             goto error;
         }
         currentPC += instr.length;
