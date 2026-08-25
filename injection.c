@@ -108,6 +108,9 @@ typedef struct
 static ThreadHijackState g_hijackedThreadState;
 static SharedLogObject* g_sharedLog;
 
+#define DBI_ZYDIS_DISPATCH_REG ZYDIS_REGISTER_R11
+#define DBI_ZYDIS_STATE_REG ZYDIS_REGISTER_R10
+
 // scratch for holding the next PC we should go to
 |.define DBI_DISPATCH_REG, r11
 // holds our global state, usually g_hijackedThreadState or something inside it
@@ -639,6 +642,9 @@ bool CodeCacheInit(uintptr_t nearPc)
     // up and down in memory (+ and -)
     // trying to find a contiguous DBI_CODE_CACHE_SIZE block of available memory we can allocate for our code cache
 
+    // TODO: allocate multiple code cache arenas, so when we go to reserve from the code cache, we can try our best to 
+    // pick an arena within +-2GB from that original block's PC. Right now we only allocate 1 arena.
+
     SYSTEM_INFO sysInfo;
     GetSystemInfo(&sysInfo);
     uintptr_t granularity = sysInfo.dwAllocationGranularity;
@@ -748,7 +754,7 @@ bool HasRipRelativeMemoryOp(ZydisDecodedInstruction* instr, ZydisDecodedOperand*
     return false;
 }
 
-bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, uintptr_t appPc, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands)
+bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, dasm_State** MainDst, uintptr_t appPc, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands)
 {
     // if it's not a rip-relative instruction, we can just emit the original one exactly as it was
     bool isRipRelativeMemoryOperand = HasRipRelativeMemoryOp(instr, operands);
@@ -777,7 +783,9 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, uintptr_t appPc, Zyd
     // so the new displacement is
     // new_disp32 = absoluteTarget - cache_next_rip;
 
+    bool neededLongjump = false;
     uint8_t* codeCachePc = cursor->cursor;
+
     for (int i = 0; i < instr->operand_count_visible; i++)
     {
         ZydisDecodedOperand* operand = &operands[i];
@@ -801,24 +809,53 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, uintptr_t appPc, Zyd
         }
 
         // from the code cache rip, can i still address the original memory target via rel32?
-        if (!IsRel32Reachable(newCodeCacheNextRip, (uintptr_t)absoluteTarget))
+        if (IsRel32Reachable(newCodeCacheNextRip, (uintptr_t)absoluteTarget))
         {
-            PeonyLogf("Relocated RIP-relative target is not within rel32 range! What the heck do we do??? codeCacheNextRip = %p  absoluteTarget = %p\n", newCodeCacheNextRip, absoluteTarget);
-            // If we hit this, the program would crash/break. There's probably a way to handle this case with some extra instrumentation"
-            return false;
+            // rel32 is enough to address the original memory, so we can just do the simple math and reassign the rip-relative part of the operand
+            req.operands[i].mem.displacement = (int64_t)((uintptr_t)absoluteTarget - newCodeCacheNextRip);
         }
-        // rel32 is enough to address the original memory, so we can just do the simple math and reassign the rip-relative part of the operand
-        req.operands[i].mem.displacement = (int64_t)((uintptr_t)absoluteTarget - newCodeCacheNextRip);
+        else
+        {
+            PeonyLogf("Relocated RIP-relative target is not within rel32 range. codeCacheNextRip = %p  absoluteTarget = %p\n", newCodeCacheNextRip, absoluteTarget);
+            for (int j = 0; j < instr->operand_count_visible; j++)
+            {
+                assert(req.operands[j].mem.base != DBI_ZYDIS_DISPATCH_REG); // if we hit cases where our scratch reg is the destination, we should detect that and just use a different scratch reg
+            }
+            // need a far jump if it's not rel32 reachable, so we use a scratch reg
+            dasm_State* D = NULL;
+            dasm_State** Dst = &D;
+            DbiDynasmInit(Dst);
+            | push DBI_DISPATCH_REG
+            | mov64 DBI_DISPATCH_REG, (uintptr_t)absoluteTarget
+            
+            DbiDynasmEncodeSnippet(Dst, cursor, NULL);
+            dasm_free(Dst);
+            req.operands[i].mem.base = DBI_ZYDIS_DISPATCH_REG;
+            req.operands[i].mem.displacement = 0;
+            neededLongjump = true;
+            break;
+        }
     }
 
     // emit relocated instruction
     ZyanUSize encodedLength = ZYDIS_MAX_INSTRUCTION_LENGTH;
-    if (ZYAN_FAILED(ZydisEncoderEncodeInstruction(&req, cursor->cursor, &encodedLength)))
+    ZyanStatus status = ZydisEncoderEncodeInstruction(&req, cursor->cursor, &encodedLength);
+    if (ZYAN_FAILED(status))
     {
-        PeonyLogf("Failed to encode relocated instruction at %p", (void*)appPc);
+        PeonyLogf("Failed to encode relocated instruction at %p status module = %i status = %i", (void*)appPc, ZYAN_STATUS_MODULE(status), ZYAN_STATUS_CODE(status));
         return false;
     }
     cursor->cursor += encodedLength;
+
+    if (neededLongjump)
+    {
+        dasm_State* D = NULL;
+        dasm_State** Dst = &D;
+        DbiDynasmInit(Dst);
+        | pop DBI_DISPATCH_REG
+        DbiDynasmEncodeSnippet(Dst, cursor, NULL);
+        dasm_free(Dst);
+    }
 
     return true;
 }
@@ -1087,7 +1124,7 @@ bool CompileBlockTerminator(
         } break;
         case ZYDIS_CATEGORY_SYSCALL:
         {
-            if (!EmitAndPossiblyRelocateInstruction(cursor, currentPC, instr, operands))
+            if (!EmitAndPossiblyRelocateInstruction(cursor, Dst, currentPC, instr, operands))
             {
                 PeonyLogf("Something went wrong emitting instructions for syscall/sysret");
                 return false;
@@ -1183,7 +1220,7 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
             break;
         }
 
-        if (!EmitAndPossiblyRelocateInstruction(&codeOut, currentPC, &instr, operands))
+        if (!EmitAndPossiblyRelocateInstruction(&codeOut, Dst, currentPC, &instr, operands))
         {
             LogDecodedInstructionRange("failed to emit/relocate instruction", &decoder, &fmt, currentPC, instr.length);
             goto error;
