@@ -9,6 +9,7 @@
 #include <string.h>
 #include <windows.h>
 #include <TlHelp32.h>
+#include <dbghelp.h>
 #include "Zydis.h"
 
 #define DASM_FDEF static
@@ -968,16 +969,16 @@ bool CompileBlockTerminator(
             // direct call EX: "call 0x00007FF6327770A8"
             if (GetDirectRelativeTarget(instr, operands, currentPC, &targetAddress))
             {
-            // we push the "return" address on the stack.
-            // we will be returning to this current (really, next) pc
-            // we dont want to clobber regs here, so we use this xchg trick on the stack 
-            // to make sure DBI_DISPATCH_REG is the same as before, and top of the stack has the return address (nextSeqAppPC)
-            DbiEmitPush(Dst, nextSeqAppPC);
-            if (!DbiEmitPatchableExit(Dst, targetAddress, patchLabels))
-            {
-                return false;
-            }
-            return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+                // we push the "return" address on the stack.
+                // we will be returning to this current (really, next) pc
+                // we dont want to clobber regs here, so we use this xchg trick on the stack 
+                // to make sure DBI_DISPATCH_REG is the same as before, and top of the stack has the return address (nextSeqAppPC)
+                DbiEmitPush(Dst, nextSeqAppPC);
+                if (!DbiEmitPatchableExit(Dst, targetAddress, patchLabels))
+                {
+                    return false;
+                }
+                return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
             // static memory indirect call EX: "call [0x00007FF6327770A8]"
             else if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY && instr->meta.branch_type != ZYDIS_BRANCH_TYPE_FAR)
@@ -1479,10 +1480,88 @@ bool HijackThreadRip(DWORD targetThreadId)
 #endif
 }
 
+static void CrashPrintStackTrace(EXCEPTION_POINTERS* exceptionInfo)
+{
+    HANDLE process = GetCurrentProcess();
+    HANDLE thread = GetCurrentThread();
+
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(process, NULL, TRUE);
+
+    CONTEXT context = *exceptionInfo->ContextRecord;
+    STACKFRAME64 frame = {};
+    DWORD machineType = 0;
+
+#if defined(_M_X64) || defined(__x86_64__)
+    machineType = IMAGE_FILE_MACHINE_AMD64;
+    frame.AddrPC.Offset = context.Rip;
+    frame.AddrFrame.Offset = context.Rbp;
+    frame.AddrStack.Offset = context.Rsp;
+#elif defined(_M_IX86) || defined(__i386__)
+    machineType = IMAGE_FILE_MACHINE_I386;
+    frame.AddrPC.Offset = context.Eip;
+    frame.AddrFrame.Offset = context.Ebp;
+    frame.AddrStack.Offset = context.Esp;
+#else
+    stackTrace.Append(STRING_LIT("Stack walking is not implemented for this CPU architecture.\n"));
+    return;
+#endif
+
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Mode = AddrModeFlat;
+
+    for (unsigned int frameIdx = 0; frameIdx < 128; frameIdx++)
+    {
+        if (!StackWalk64(machineType, process, thread, &frame, &context, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL))
+            break;
+        if (frame.AddrPC.Offset == 0)
+            break;
+
+        DWORD64 displacement = 0;
+        char symbolStorage[sizeof(SYMBOL_INFO) + 512] = {};
+        SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbolStorage;
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 511;
+
+        IMAGEHLP_LINE64 line = {};
+        line.SizeOfStruct = sizeof(line);
+        DWORD lineDisplacement = 0;
+
+        bool hasSymbol = SymFromAddr(process, frame.AddrPC.Offset, &displacement, symbol) != FALSE;
+        bool hasLine = SymGetLineFromAddr64(process, frame.AddrPC.Offset, &lineDisplacement, &line) != FALSE;
+
+        if (hasSymbol && hasLine)
+        {
+            PeonyLogf("#%02u 0x%llx %s + 0x%llx (%s:%lu)\n",
+                frameIdx, frame.AddrPC.Offset, symbol->Name, displacement, line.FileName, line.LineNumber);
+        }
+        else if (hasSymbol)
+        {
+            PeonyLogf("#%02u 0x%llx %s + 0x%llx\n",
+                frameIdx, frame.AddrPC.Offset, symbol->Name, displacement);
+        }
+        else
+        {
+            PeonyLogf("#%02u 0x%llx\n", frameIdx, frame.AddrPC.Offset);
+        }
+    }
+}
+
+static LONG WINAPI PeonyUnhandledExceptionFilter(EXCEPTION_POINTERS* exceptionInfo)
+{
+    EXCEPTION_RECORD* record = exceptionInfo->ExceptionRecord;
+    PeonyLogf("Unhandled exception 0x%08lx at 0x%p\nProcess: %lu\nThread: %lu\n\nStack trace:\n",
+        record->ExceptionCode, record->ExceptionAddress, GetCurrentProcessId(), GetCurrentThreadId());
+    CrashPrintStackTrace(exceptionInfo);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 #define DEBUG_PICK_THREAD_CONTAINS_NAME "main"
 
 void Initialize()
 {
+    SetUnhandledExceptionFilter(PeonyUnhandledExceptionFilter);
     PeonyLogf("Hello from injection dll! Zydis version = %llu", ZydisGetVersion());
     DWORD pid = GetProcessId(GetCurrentProcess());
     SharedCommsObject* sharedComms = SharedCommsInitialize();
