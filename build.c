@@ -84,7 +84,7 @@ static bool run_dynasm(void)
     nob_cmd_append(&cmd,
                    MINILUA,
                    DYNASM_LUA,
-                   "-L",
+                   //"-L", // --nolineno   defining this means no source code line information emitted. Meant for release builds. 
                    "-I", "external/LuaJIT/dynasm",
                    "-o", DYNASM_INJECTION_C,
                    "injection.c");
