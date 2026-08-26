@@ -363,7 +363,7 @@ bool IsAddressInSpecifiedModules(void* address, const char** moduleNames, int nu
         char filepathFull[MAX_PATH];
         if (GetModuleFileNameA((HMODULE)mbi.AllocationBase, filepathFull, MAX_PATH) > 0) 
         {
-            char* filename = strchr(filepathFull, L'\\');
+            char* filename = strrchr(filepathFull, L'\\');
             filename = filename ? filename + 1 : filepathFull;
             if (strcmp(filename, moduleNames[i]) == 0) 
             {
