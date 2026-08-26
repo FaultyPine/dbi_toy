@@ -35,14 +35,20 @@ typedef struct
 {
     DWORD64 originalR10;
     CONTEXT savedRegs;
+    _Alignas(16) uint8_t fpuState[512];
 } ThreadHijackState;
 
 #define SAVEDREGS_OFF_NUM 16
 #define SAVEDREGS_OFF STRINGIFY_MACRO(SAVEDREGS_OFF_NUM)
 #define ORIGR10_OFF_NUM 0
 #define ORIGR10_OFF STRINGIFY_MACRO(ORIGR10_OFF_NUM)
+#define FPUSTATE_OFF_NUM 1248
+#define FPUSTATE_OFF STRINGIFY_MACRO(FPUSTATE_OFF_NUM)
 _Static_assert(offsetof(ThreadHijackState, originalR10) == ORIGR10_OFF_NUM, "unexpected ThreadHijackState layout");
 _Static_assert(offsetof(ThreadHijackState, savedRegs) == SAVEDREGS_OFF_NUM, "unexpected ThreadHijackState layout");
+_Static_assert(offsetof(ThreadHijackState, fpuState) == FPUSTATE_OFF_NUM, "unexpected ThreadHijackState fpuState offset");
+_Static_assert((offsetof(ThreadHijackState, fpuState) % 16) == 0, "ThreadHijackState fpuState must be 16-byte aligned");
+_Static_assert(sizeof(((ThreadHijackState*)0)->fpuState) == 512, "FXSAVE area must be 512 bytes");
 
 typedef struct 
 {
@@ -1277,13 +1283,6 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
         goto error;
     }
 
-    const char* excludedModules[] = {"ntdll.dll"};
-    if (IsAddressInSpecifiedModules((void*)appPc, excludedModules, ARRAYSIZE(excludedModules)))
-    {
-        PeonyLogf("Skipping instrumentation of ntdll code");
-        goto error;
-    }
-
     uint64_t currentPC = appPc;
     // code emitting "cursor". this points to the code cache we need to write the jitted instructions to
     CodeCursor codeOut = {.cursor = blockStart}; 
@@ -1413,6 +1412,9 @@ void RestoreRegisters(void)
     __asm__(
         ".intel_syntax noprefix\n"
 
+        // Restore x87 FPU, MMX, XMM0-XMM15, and MXCSR. This does not restore AVX upper YMM/ZMM state.
+        "fxrstor64 [r10 + " FPUSTATE_OFF "]\n"
+
         // cpu flags restore
         "mov eax, dword ptr [r10 + " SAVEDREGS_OFF " + " CTXOFFSET_RFLAGS "]\n" // rax = (uint32)state->savedRegs.EFlags
         "push rax\n" // push savedRegs.EFlags onto stack
@@ -1454,6 +1456,9 @@ void SaveRegisters(void)
     // r10 should contain the ThreadHijackState
     __asm__(
         ".intel_syntax noprefix\n"
+        // Save x87 FPU, MMX, XMM0-XMM15, and MXCSR. This does not save AVX upper YMM/ZMM state.
+        "fxsave64 [r10 + " FPUSTATE_OFF "]\n"
+
         // saving rax before clobber
         "mov qword ptr [r10 + ("CTXOFFSET_RAX" + " SAVEDREGS_OFF ")], rax\n"
         // r10 contains important state, we use rax as tmp to store it
