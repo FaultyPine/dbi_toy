@@ -111,6 +111,37 @@ static SharedLogObject* g_sharedLog;
 #define DBI_ZYDIS_DISPATCH_REG ZYDIS_REGISTER_R11
 #define DBI_ZYDIS_STATE_REG ZYDIS_REGISTER_R10
 
+static bool ZydisRegisterToDbiGprIndex(ZydisRegister reg, int* outIndex)
+{
+    if (reg >= ZYDIS_REGISTER_RAX && reg <= ZYDIS_REGISTER_R15)
+    {
+        *outIndex = (int)(reg - ZYDIS_REGISTER_RAX);
+        return true;
+    }
+    if (reg >= ZYDIS_REGISTER_EAX && reg <= ZYDIS_REGISTER_R15D)
+    {
+        *outIndex = (int)(reg - ZYDIS_REGISTER_EAX);
+        return true;
+    }
+    if (reg >= ZYDIS_REGISTER_AX && reg <= ZYDIS_REGISTER_R15W)
+    {
+        *outIndex = (int)(reg - ZYDIS_REGISTER_AX);
+        return true;
+    }
+    if (reg >= ZYDIS_REGISTER_AL && reg <= ZYDIS_REGISTER_BL)
+    {
+        *outIndex = (int)(reg - ZYDIS_REGISTER_AL);
+        return true;
+    }
+    if (reg >= ZYDIS_REGISTER_SPL && reg <= ZYDIS_REGISTER_R15B)
+    {
+        *outIndex = (int)(reg - ZYDIS_REGISTER_SPL) + 4;
+        return true;
+    }
+
+    return false;
+}
+
 // scratch for holding the next PC we should go to
 |.define DBI_DISPATCH_REG, r11
 // holds our global state, usually g_hijackedThreadState or something inside it
@@ -1102,6 +1133,21 @@ bool CompileBlockTerminator(
                 | mov64 DBI_DISPATCH_REG, jmpMemAddress
                 | mov DBI_DISPATCH_REG, qword [DBI_DISPATCH_REG]
                 // TODO: this is not currently backpatchable, but getting indirect jumps to be backpatchable is complicated.
+                DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
+                return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+            }
+            else if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+            {
+                ZydisRegister jumpReg = operands[0].reg.value;
+                int jumpRegIndex = 0;
+                if (!ZydisRegisterToDbiGprIndex(jumpReg, &jumpRegIndex))
+                {
+                    PeonyLogf("Unsupported register unconditional branch at %p", (void*)currentPC);
+                    return false;
+                }
+
+                | push DBI_DISPATCH_REG
+                | mov DBI_DISPATCH_REG, Rq(jumpRegIndex)
                 DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
                 return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
