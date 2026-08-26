@@ -1100,6 +1100,22 @@ bool CompileBlockTerminator(
                 DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
                 return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
+            else if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+            {
+                ZydisRegister jumpReg = operands[0].reg.value;
+                int jumpRegIndex = 0;
+                if (!ZydisRegisterToDbiGprIndex(jumpReg, &jumpRegIndex))
+                {
+                    PeonyLogf("Unsupported register call at %p", (void*)currentPC);
+                    return false;
+                }
+                DbiEmitPush(Dst, nextSeqAppPC);
+
+                | push DBI_DISPATCH_REG
+                | mov DBI_DISPATCH_REG, Rq(jumpRegIndex)
+                DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
+                return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+            }
             return false;
         } break;
         case ZYDIS_CATEGORY_UNCOND_BR:
@@ -1574,6 +1590,15 @@ bool HijackThreadRip(DWORD targetThreadId)
     g_hijackedThreadState.savedRegs.Rip = originalRip;
     // as soon as the thread resumes, it'll run our hijack asm which eventually calls our C func OnDBIExit
     context.Rip = (DWORD64)(uintptr_t)DBIExitTrampoline;
+
+    // TODO: preallocate the code cache so we aren't doing reallocations inside instrumentation code (messes with CRT heaps)
+    if (!CodeCacheInit(originalRip))
+    {
+        PeonyLogf("Failed to initialize code cache during injection attachment");
+        ResumeThread(threadHdl);
+        CloseHandle(threadHdl);
+        return false;
+    }
 
     if (!SetThreadContext(threadHdl, &context))
     {
