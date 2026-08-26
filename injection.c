@@ -345,6 +345,37 @@ DWORD WINAPI InitializeThread(LPVOID param)
     return 0;
 }
 
+bool IsAddressInSpecifiedModules(void* address, const char** moduleNames, int numModuleNames) 
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) 
+    {
+        return false;
+    }
+    // Ensure the memory belongs to an image (PE module/DLL) allocation
+    if (mbi.State != MEM_COMMIT || mbi.Type != MEM_IMAGE) 
+    {
+        return false;
+    }
+
+    for (int i = 0; i < numModuleNames; i++)
+    {
+        char filepathFull[MAX_PATH];
+        if (GetModuleFileNameA((HMODULE)mbi.AllocationBase, filepathFull, MAX_PATH) > 0) 
+        {
+            char* filename = strchr(filepathFull, L'\\');
+            filename = filename ? filename + 1 : filepathFull;
+            if (strcmp(filename, moduleNames[i]) == 0) 
+            {
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
+
+
 ModuleInfo* ListProcessModules(DWORD pid)
 {
     ModuleInfo* result = NULL;
@@ -1181,6 +1212,13 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
     if (ZYAN_FAILED(ZydisFormatterInit(&fmt, ZYDIS_FORMATTER_STYLE_INTEL)))
     {
         PeonyLogf("Failed to init zydis formatter");
+        goto error;
+    }
+
+    const char* excludedModules[] = {"ntdll.dll"};
+    if (IsAddressInSpecifiedModules((void*)appPc, excludedModules, ARRAYSIZE(excludedModules)))
+    {
+        PeonyLogf("Skipping instrumentation of ntdll code");
         goto error;
     }
 

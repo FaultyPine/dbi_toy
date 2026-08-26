@@ -226,7 +226,7 @@ DWORD WINAPI InjectedLogPumpThread(LPVOID param)
 // =========== CMDLINE ARG PARSING ===============
 #define DECLARE_CMDLINE_ARGS \
     X(pid, ParsePid) \
-    X(exeName, ParseExeName) \
+    X(exename, ParseExeName) \
     X(targetThreadId, ParseTargetThreadId)
 
 typedef enum
