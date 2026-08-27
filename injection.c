@@ -108,7 +108,7 @@ typedef struct
     uint8_t* cursor;
 } CodeCursor;
 
-#define DBI_CODE_CACHE_SIZE (5 * MB)
+#define DBI_CODE_CACHE_SIZE (10 * MB)
 #define DBI_LOG_COMPILATION_VERBOSE 1
 
 static ThreadHijackState g_hijackedThreadState;
@@ -116,37 +116,6 @@ static SharedLogObject* g_sharedLog;
 
 #define DBI_ZYDIS_DISPATCH_REG ZYDIS_REGISTER_R11
 #define DBI_ZYDIS_STATE_REG ZYDIS_REGISTER_R10
-
-static bool ZydisRegisterToDbiGprIndex(ZydisRegister reg, int* outIndex)
-{
-    if (reg >= ZYDIS_REGISTER_RAX && reg <= ZYDIS_REGISTER_R15)
-    {
-        *outIndex = (int)(reg - ZYDIS_REGISTER_RAX);
-        return true;
-    }
-    if (reg >= ZYDIS_REGISTER_EAX && reg <= ZYDIS_REGISTER_R15D)
-    {
-        *outIndex = (int)(reg - ZYDIS_REGISTER_EAX);
-        return true;
-    }
-    if (reg >= ZYDIS_REGISTER_AX && reg <= ZYDIS_REGISTER_R15W)
-    {
-        *outIndex = (int)(reg - ZYDIS_REGISTER_AX);
-        return true;
-    }
-    if (reg >= ZYDIS_REGISTER_AL && reg <= ZYDIS_REGISTER_BL)
-    {
-        *outIndex = (int)(reg - ZYDIS_REGISTER_AL);
-        return true;
-    }
-    if (reg >= ZYDIS_REGISTER_SPL && reg <= ZYDIS_REGISTER_R15B)
-    {
-        *outIndex = (int)(reg - ZYDIS_REGISTER_SPL) + 4;
-        return true;
-    }
-
-    return false;
-}
 
 // scratch for holding the next PC we should go to
 |.define DBI_DISPATCH_REG, r11
@@ -514,6 +483,32 @@ bool ShouldWeCareAboutThisModule(SharedCommsObject* sharedComms, const ModuleInf
     return true;
 }
 
+// normalizes register aliases into their real physical register value
+// like ZYDIS_REGISTER_R11D -> ZYDIS_REGISTER_R11
+static ZydisRegister NormalizeGprRegister(ZydisRegister reg)
+{
+    ZydisRegister largestReg = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg);
+    return largestReg != ZYDIS_REGISTER_NONE ? largestReg : reg;
+}
+
+static bool ZydisRegisterToDbiGprIndex(ZydisRegister reg, int* outIndex)
+{
+    if (reg >= ZYDIS_REGISTER_AH && reg <= ZYDIS_REGISTER_BH)
+    {
+        PeonyLogf("Unsupported legacy x86 instruction encountered %u", reg);
+        return false;
+    }
+
+    ZydisRegister normalizedReg = NormalizeGprRegister(reg);
+    if (normalizedReg >= ZYDIS_REGISTER_RAX && normalizedReg <= ZYDIS_REGISTER_R15)
+    {
+        *outIndex = (int)(normalizedReg - ZYDIS_REGISTER_RAX);
+        return true;
+    }
+
+    return false;
+}
+
 static bool IsBasicBlockTerminator(const ZydisDecodedInstruction* instr)
 {
     switch (instr->meta.category)
@@ -807,14 +802,6 @@ bool GetDirectRelativeTarget(
 bool IsRipRelativeMemoryOp(ZydisDecodedOperand* op)
 {
     return op->type == ZYDIS_OPERAND_TYPE_MEMORY && (op->mem.base == ZYDIS_REGISTER_RIP || op->mem.base == ZYDIS_REGISTER_EIP);
-}
-
-// normalizes register aliases into their real physical register value
-// like ZYDIS_REGISTER_R11D -> ZYDIS_REGISTER_R11
-static ZydisRegister NormalizeGprRegister(ZydisRegister reg)
-{
-    ZydisRegister largestReg = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg);
-    return largestReg != ZYDIS_REGISTER_NONE ? largestReg : reg;
 }
 
 static bool OperandUsesRegister(const ZydisDecodedOperand* operand, ZydisRegister reg)
@@ -1157,15 +1144,14 @@ bool CompileBlockTerminator(
                 return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
             // static memory indirect call EX: "call [0x00007FF6327770A8]"
-            else if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY && instr->meta.branch_type != ZYDIS_BRANCH_TYPE_FAR)
+            else if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY && instr->meta.branch_type != ZYDIS_BRANCH_TYPE_FAR)
             {
                 ZyanU64 jmpMemAddress = 0; // ^  this is the absolute address of the memory that contains the address we should jump to
                 if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &jmpMemAddress)))
                 {
-                    PeonyLogf("Failed to resolve direct branch target at %p", (void*)currentPC);
+                    PeonyLogf("Failed to resolve call jump target at %p", (void*)currentPC);
                     return false;
                 }
-                PeonyLogf("memory call jmpMemAddress = %p  nextSeqAppPC = %p currentPC = %p", jmpMemAddress, nextSeqAppPC, currentPC);
                 DbiEmitPush(Dst, nextSeqAppPC);
 
                 // the emitexit call will always pop dispatch_reg back
@@ -1177,7 +1163,7 @@ bool CompileBlockTerminator(
                 DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
                 return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
-            else if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+            else if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
             {
                 ZydisRegister jumpReg = operands[0].reg.value;
                 int jumpRegIndex = 0;
@@ -1201,7 +1187,7 @@ bool CompileBlockTerminator(
 
             uintptr_t targetAppPC = nextSeqAppPC;
             // immediate jmp EX: jmp 0xDEADBEEF
-            if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
+            if (operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
             {
                 ZyanU64 absoluteTarget = 0;
                 if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &absoluteTarget)))
@@ -1212,7 +1198,7 @@ bool CompileBlockTerminator(
                 targetAppPC = (uintptr_t)absoluteTarget;
             }
             // static memory indirect jmp EX: "jmp [0x00007FF6327770A8]"
-            else if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
+            else if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
             {
                 ZyanU64 jmpMemAddress = 0; // ^  this is the absolute address of the memory that contains the address we should jump to
                 if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &jmpMemAddress)))
@@ -1229,7 +1215,7 @@ bool CompileBlockTerminator(
                 DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
                 return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
-            else if (instr->operand_count_visible > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+            else if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
             {
                 ZydisRegister jumpReg = operands[0].reg.value;
                 int jumpRegIndex = 0;
