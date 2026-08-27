@@ -809,6 +809,66 @@ bool IsRipRelativeMemoryOp(ZydisDecodedOperand* op)
     return op->type == ZYDIS_OPERAND_TYPE_MEMORY && (op->mem.base == ZYDIS_REGISTER_RIP || op->mem.base == ZYDIS_REGISTER_EIP);
 }
 
+// normalizes register aliases into their real physical register value
+// like ZYDIS_REGISTER_R11D -> ZYDIS_REGISTER_R11
+static ZydisRegister NormalizeGprRegister(ZydisRegister reg)
+{
+    ZydisRegister largestReg = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg);
+    return largestReg != ZYDIS_REGISTER_NONE ? largestReg : reg;
+}
+
+static bool OperandUsesRegister(const ZydisDecodedOperand* operand, ZydisRegister reg)
+{
+    ZydisRegister normalizedReg = NormalizeGprRegister(reg);
+    switch (operand->type)
+    {
+        case ZYDIS_OPERAND_TYPE_REGISTER:
+            return NormalizeGprRegister(operand->reg.value) == normalizedReg;
+
+        case ZYDIS_OPERAND_TYPE_MEMORY:
+            if (NormalizeGprRegister(operand->mem.base) == normalizedReg)
+            {
+                return true;
+            }
+            if (NormalizeGprRegister(operand->mem.index) == normalizedReg)
+            {
+                return true;
+            }
+            return false;
+
+        default:
+            return false;
+    }
+}
+
+static bool InstructionUsesRegister(const ZydisDecodedInstruction* instr, const ZydisDecodedOperand* operands, ZydisRegister reg)
+{
+    for (int i = 0; i < instr->operand_count_visible; i++)
+    {
+        if (OperandUsesRegister(&operands[i], reg))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static ZydisRegister PickUnusedRegister(
+    const ZydisDecodedInstruction* instr,
+    const ZydisDecodedOperand* operands,
+    const ZydisRegister* candidates,
+    int numCandidates)
+{
+    for (int i = 0; i < numCandidates; i++)
+    {
+        if (!InstructionUsesRegister(instr, operands, candidates[i]))
+        {
+            return candidates[i];
+        }
+    }
+    return ZYDIS_REGISTER_NONE;
+}
+
 bool HasRipRelativeMemoryOp(ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands)
 {
     for (int i = 0; i < instr->operand_count_visible; i++)
@@ -852,6 +912,9 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, dasm_State** MainDst
     // new_disp32 = absoluteTarget - cache_next_rip;
 
     bool neededLongjump = false;
+    ZydisRegister scratchReg = ZYDIS_REGISTER_NONE;
+    int scratchRegIndex = 0;
+    const ZydisRegister ripRelocationScratchRegs[] = {DBI_ZYDIS_DISPATCH_REG, DBI_ZYDIS_STATE_REG};
     uint8_t* codeCachePc = cursor->cursor;
 
     for (int i = 0; i < instr->operand_count_visible; i++)
@@ -885,20 +948,28 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, dasm_State** MainDst
         else
         {
             PeonyLogf("Relocated RIP-relative target is not within rel32 range. codeCacheNextRip = %p  absoluteTarget = %p\n", newCodeCacheNextRip, absoluteTarget);
-            for (int j = 0; j < instr->operand_count_visible; j++)
+            scratchReg = PickUnusedRegister(instr, operands, ripRelocationScratchRegs, ARRAYSIZE(ripRelocationScratchRegs));
+            if (scratchReg == ZYDIS_REGISTER_NONE)
             {
-                assert(req.operands[j].mem.base != DBI_ZYDIS_DISPATCH_REG); // if we hit cases where our scratch reg is the destination, we should detect that and just use a different scratch reg
+                PeonyLogf("Could not find a scratch register for RIP-relative relocation at %p", (void*)appPc);
+                return false;
             }
+            if (!ZydisRegisterToDbiGprIndex(scratchReg, &scratchRegIndex))
+            {
+                PeonyLogf("Scratch register for RIP-relative relocation was not a GPR at %p", (void*)appPc);
+                return false;
+            }
+
             // need a far jump if it's not rel32 reachable, so we use a scratch reg
             dasm_State* D = NULL;
             dasm_State** Dst = &D;
             DbiDynasmInit(Dst);
-            | push DBI_DISPATCH_REG
-            | mov64 DBI_DISPATCH_REG, (uintptr_t)absoluteTarget
+            | push Rq(scratchRegIndex)
+            | mov64 Rq(scratchRegIndex), (uintptr_t)absoluteTarget
             
             DbiDynasmEncodeSnippet(Dst, cursor, NULL);
             dasm_free(Dst);
-            req.operands[i].mem.base = DBI_ZYDIS_DISPATCH_REG;
+            req.operands[i].mem.base = scratchReg;
             req.operands[i].mem.displacement = 0;
             neededLongjump = true;
             break;
@@ -920,7 +991,7 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, dasm_State** MainDst
         dasm_State* D = NULL;
         dasm_State** Dst = &D;
         DbiDynasmInit(Dst);
-        | pop DBI_DISPATCH_REG
+        | pop Rq(scratchRegIndex)
         DbiDynasmEncodeSnippet(Dst, cursor, NULL);
         dasm_free(Dst);
     }
