@@ -12,6 +12,7 @@
 #define ZYDIS_CONFIG "RelWithDebInfo"
 #define ZYDIS_LIB ZYDIS_BUILD "/" ZYDIS_CONFIG "/Zydis.lib"
 #define ZYCORE_LIB ZYDIS_BUILD "/zycore/" ZYDIS_CONFIG "/Zycore.lib"
+#define MIMALLOC_ROOT "external/mimalloc"
 
 static bool require_file(const char *path, const char *message)
 {
@@ -114,9 +115,15 @@ static bool build_injection(void)
                    "-lZydis",
                    "-L" ZYDIS_BUILD "/zycore/" ZYDIS_CONFIG,
                    "-lZycore",
+                   "-lpsapi",
+                   "-lshell32",
+                   "-luser32",
+                   "-ladvapi32",
+                   "-lbcrypt",
                    "-DZYDIS_STATIC_BUILD",
                    "-DZYCORE_STATIC_BUILD",
                    "-I.",
+                   "-I" MIMALLOC_ROOT "/include",
                    "-Iexternal/LuaJIT/dynasm");
     return nob_cmd_run(&cmd);
 }
@@ -139,7 +146,8 @@ int main(int argc, char **argv)
 
     if (!nob_mkdir_if_not_exists(BUILD_DIR)) return 1;
 
-    if (!require_file(DYNASM_LUA, "missing LuaJIT DynASM checkout; run: git submodule update --init external/LuaJIT")) return 1;
+    if (!require_file(DYNASM_LUA, "missing LuaJIT DynASM checkout, make sure you've pulled in the git submodules")) return 1;
+    if (!require_file(MIMALLOC_ROOT "/src/static.c", "missing mimalloc checkout, make sure you've pulled in the git submodules")) return 1;
     if (!build_minilua()) return 1;
     if (!ensure_zydis()) return 1;
     if (!run_dynasm()) return 1;

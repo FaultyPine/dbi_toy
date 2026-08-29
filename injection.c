@@ -1,6 +1,10 @@
 
 // this is a shared lib that is injected into the remote process and is in charge of instrumenting the process it is injected into
 
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -12,6 +16,48 @@
 #include <dbghelp.h>
 #include "Zydis.h"
 
+#define MI_STATIC_LIB
+#define MI_WIN_NOREDIRECT 1
+#define MI_BUILD_RELEASE
+#define MI_CMAKE_BUILD_TYPE release
+
+#if defined(__clang__) && defined(_MSC_VER) && !defined(__GNUC__)
+#pragma push_macro("_MSC_VER")
+#pragma push_macro("__GNUC__")
+#pragma push_macro("__GNUC_MINOR__")
+#pragma push_macro("__GNUC_PATCHLEVEL__")
+#undef _MSC_VER
+#define __GNUC__ 4
+#define __GNUC_MINOR__ 2
+#define __GNUC_PATCHLEVEL__ 1
+#include "external/mimalloc/src/static.c"
+#pragma pop_macro("__GNUC_PATCHLEVEL__")
+#pragma pop_macro("__GNUC_MINOR__")
+#pragma pop_macro("__GNUC__")
+#pragma pop_macro("_MSC_VER")
+#else
+#include "external/mimalloc/src/static.c"
+#endif
+
+static bool DbiAllocatorInit(void);
+static void* DbiRealloc(void* ptr, size_t size);
+static void DbiFree(void* ptr);
+static void DbiAllocatorFatalOutOfMemory(size_t size);
+
+#define DASM_M_GROW(ctx, t, p, sz, need) \
+    do { \
+        size_t _sz = (sz); \
+        size_t _need = (need); \
+        if (_sz < _need) { \
+            if (_sz < 16) _sz = 16; \
+            while (_sz < _need) _sz += _sz; \
+            (p) = (t*)DbiRealloc((p), _sz); \
+            if ((p) == NULL) DbiAllocatorFatalOutOfMemory(_sz); \
+            (sz) = _sz; \
+        } \
+    } while (0)
+#define DASM_M_FREE(ctx, p, sz) DbiFree(p)
+
 #define DASM_FDEF static
 #include "dasm_proto.h"
 #include "dasm_x86.h"
@@ -20,6 +66,8 @@
 |.actionlist peony_dynasm_actions
 |.section code
 
+#define STBDS_REALLOC(ctx, ptr, size) DbiRealloc((ptr), (size))
+#define STBDS_FREE(ctx, ptr) DbiFree(ptr)
 #define STB_DS_IMPLEMENTATION
 #include "external/std_ds.h"
 #include "shared_defines.h"
@@ -102,6 +150,8 @@ typedef struct
 
 static CodeCache g_codeCache;
 static PendingExitPatchEntry* g_pendingExitPatches;
+static INIT_ONCE g_dbiHeapInitOnce = INIT_ONCE_STATIC_INIT;
+static mi_heap_t* g_dbiHeap;
 
 typedef struct
 {
@@ -129,6 +179,58 @@ static const uintptr_t DBI_CODE_CACHE_NEAR_SEARCH_RADIUS = 0x70000000ULL;
 void Initialize();
 DWORD WINAPI InitializeThread(LPVOID param);
 void DBIExitTrampoline(void);
+
+static BOOL CALLBACK DbiAllocatorInitOnce(PINIT_ONCE initOnce, PVOID parameter, PVOID* context)
+{
+    (void)initOnce;
+    (void)parameter;
+    (void)context;
+
+    mi_process_init();
+    mi_thread_init();
+    g_dbiHeap = mi_heap_new();
+    return g_dbiHeap != NULL;
+}
+
+static bool DbiAllocatorInit(void)
+{
+    return InitOnceExecuteOnce(&g_dbiHeapInitOnce, DbiAllocatorInitOnce, NULL, NULL) && g_dbiHeap != NULL;
+}
+
+static void DbiAllocatorFatalOutOfMemory(size_t size)
+{
+    (void)size;
+    TerminateProcess(GetCurrentProcess(), ERROR_OUTOFMEMORY);
+}
+
+static void* DbiRealloc(void* ptr, size_t size)
+{
+    if (size == 0)
+    {
+        DbiFree(ptr);
+        return NULL;
+    }
+
+    if (!DbiAllocatorInit())
+    {
+        DbiAllocatorFatalOutOfMemory(size);
+        return NULL;
+    }
+
+    void* result = ptr
+        ? mi_heap_realloc(g_dbiHeap, ptr, size)
+        : mi_heap_malloc(g_dbiHeap, size);
+    if (!result)
+    {
+        DbiAllocatorFatalOutOfMemory(size);
+    }
+    return result;
+}
+
+static void DbiFree(void* ptr)
+{
+    mi_free(ptr);
+}
 
 
 BOOL WINAPI DllMain(
