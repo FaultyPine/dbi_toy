@@ -122,8 +122,17 @@ typedef struct
 
 typedef struct
 {
+    uint8_t* codeCachePc;
+    // size of code cache block
+    size_t codeCacheBytes;
+    // size of the code block in original ("app") code
+    size_t appBytes;
+} CodeCacheBlock;
+
+typedef struct
+{
     uintptr_t key; // app pc
-    uint8_t* value; // code cache pc
+    CodeCacheBlock value;
 } CodeCacheEntry;
 
 // code cache location that can & will be backpatched
@@ -150,7 +159,7 @@ typedef struct
     void* base;
     size_t capacity;
     size_t used;
-    CodeCacheEntry* entries; // hm: app PC -> code-cache PC
+    CodeCacheEntry* entries; // hm: app PC -> compiled block
 } CodeCache;
 
 static CodeCache g_codeCache;
@@ -647,7 +656,7 @@ uint8_t* CodeCacheLookup(uint64_t appPc)
         return NULL;
     }
     CodeCacheEntry* entry = hmgetp_null(g_codeCache.entries, appPc);
-    return entry ? entry->value : NULL;
+    return entry ? entry->value.codeCachePc : NULL;
 }
 
 static void DbiDynasmInit(dasm_State** Dst)
@@ -785,9 +794,14 @@ static void CodeCachePatchPendingExits(uintptr_t blockStartPC, uint8_t* targetCo
     hmdel(g_pendingExitPatches, blockStartPC);
 }
 
-static void CodeCachePublishBlock(uintptr_t appPc, uint8_t* blockStart)
+static void CodeCachePublishBlock(uintptr_t appPc, uintptr_t appEndPc, uint8_t* blockStart, uint8_t* blockEnd)
 {
-    hmput(g_codeCache.entries, appPc, blockStart);
+    CodeCacheBlock block = {
+        .codeCachePc = blockStart,
+        .appBytes = appEndPc - appPc,
+        .codeCacheBytes = blockEnd - blockStart,
+    };
+    hmput(g_codeCache.entries, appPc, block);
     CodeCachePatchPendingExits(appPc, blockStart);
 }
 
@@ -1523,7 +1537,7 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
 
     FlushInstructionCache(GetCurrentProcess(), blockStart, codeOut.cursor - blockStart);
 
-    CodeCachePublishBlock(appPc, blockStart);
+    CodeCachePublishBlock(appPc, currentPC, blockStart, codeOut.cursor);
     
 #if DBI_LOG_COMPILATION_VERBOSE
     LogCompiledBasicBlockComparison(&decoder, &fmt, appPc, currentPC, blockStart, codeOut.cursor);
