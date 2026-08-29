@@ -16,6 +16,8 @@
 #include <dbghelp.h>
 #include "Zydis.h"
 
+
+// lots of annoying stuff here because mimalloc didn't compile right under clang/windows
 #define MI_STATIC_LIB
 #define MI_WIN_NOREDIRECT 1
 #define MI_BUILD_RELEASE
