@@ -460,6 +460,66 @@ static void LogCompiledBasicBlockComparison(
     PeonyLogf("\n--------------------\n");
 }
 
+static void LogCompiledBlockContainingPc(uintptr_t pc)
+{
+    if (!g_codeCache.entries)
+    {
+        PeonyLogf("can't find PC %p because code cache is empty", (void*)pc);
+        return;
+    }
+
+    for (ptrdiff_t i = 0; i < hmlenu(g_codeCache.entries); i++)
+    {
+        CodeCacheEntry* entry = &g_codeCache.entries[i];
+        CodeCacheBlock* block = &entry->value;
+        uintptr_t appStart = entry->key;
+        uintptr_t appEnd = appStart + block->appBytes;
+        uintptr_t cacheStart = (uintptr_t)block->codeCachePc;
+        uintptr_t cacheEnd = cacheStart + block->codeCacheBytes;
+
+        const char* pcKind = NULL;
+        if (pc >= cacheStart && pc < cacheEnd)
+        {
+            pcKind = "code cache";
+        }
+        else if (pc >= appStart && pc < appEnd)
+        {
+            pcKind = "app code";
+        }
+        else
+        {
+            continue;
+        }
+
+        PeonyLogf("PC %p matched %s in compiled block. app [%p, %p) -> cache [%p, %p)",
+            (void*)pc,
+            pcKind,
+            (void*)appStart,
+            (void*)appEnd,
+            block->codeCachePc,
+            block->codeCachePc + block->codeCacheBytes);
+
+        ZydisDecoder decoder;
+        if (ZYAN_FAILED(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)))
+        {
+            PeonyLogf("Failed to init zydis decoder while logging block");
+            return;
+        }
+
+        ZydisFormatter fmt;
+        if (ZYAN_FAILED(ZydisFormatterInit(&fmt, ZYDIS_FORMATTER_STYLE_INTEL)))
+        {
+            PeonyLogf("Failed to init zydis formatter while logging block");
+            return;
+        }
+
+        LogCompiledBasicBlockComparison(&decoder, &fmt, appStart, appEnd, block->codeCachePc, block->codeCachePc + block->codeCacheBytes);
+        return;
+    }
+
+    PeonyLogf("PC %p did not match any compiled block in original app code or code cache", (void*)pc);
+}
+
 DWORD WINAPI InitializeThread(LPVOID param)
 {
     (void)param;
@@ -1287,7 +1347,7 @@ bool CompileBlockTerminator(
                         return false;
                     }
                     int offset = operands[0].mem.disp.value;
-
+                    
                     DbiEmitPush(Dst, nextSeqAppPC);
                     | push DBI_DISPATCH_REG
                     // because of the two pushes above, the stack pointer will have shifted, so any sp-relative memory reads need to be offset by the extra pushes we did here
@@ -1910,8 +1970,10 @@ static void CrashPrintStackTrace(EXCEPTION_POINTERS* exceptionInfo)
 static LONG WINAPI PeonyUnhandledExceptionFilter(EXCEPTION_POINTERS* exceptionInfo)
 {
     EXCEPTION_RECORD* record = exceptionInfo->ExceptionRecord;
-    PeonyLogf("Unhandled exception 0x%08lx at 0x%p\nProcess: %lu\nThread: %lu\n\nStack trace:\n",
+    PeonyLogf("Unhandled exception 0x%08lx at 0x%p\nProcess: %lu\nThread: %lu\n",
         record->ExceptionCode, record->ExceptionAddress, GetCurrentProcessId(), GetCurrentThreadId());
+    LogCompiledBlockContainingPc((uintptr_t)record->ExceptionAddress);
+    PeonyLogf("\nStack trace:\n");
     CrashPrintStackTrace(exceptionInfo);
     return EXCEPTION_EXECUTE_HANDLER;
 }

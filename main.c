@@ -149,11 +149,10 @@ void WriteMappedLogFileChunk(LogPumpState* state, const void* bytes, DWORD lengt
     if (!EnsureMappedLogFileCapacity(state, length))
     {
         DWORD error = GetLastError();
-        printf("[main] Failed to grow injected log file mapping (%lu); log bytes may be dropped.\n", error);
+        printf("Failed to grow injected log file mapping, err code = (%lu) NOTE! log bytes may be dropped.\n", error);
 
         uint64_t remaining = (state->logFileOffset < state->logFileCapacity)
-            ? (state->logFileCapacity - state->logFileOffset)
-            : 0;
+            ? (state->logFileCapacity - state->logFileOffset) : 0;
         if ((uint64_t)bytesToWrite > remaining)
         {
             bytesToWrite = (DWORD)remaining;
@@ -203,7 +202,7 @@ void DrainInjectedLogs(LogPumpState* state)
     LONG droppedBytes = InterlockedExchange(&log->droppedBytes, 0);
     if (droppedBytes > 0)
     {
-        printf("[main] Dropped %ld injected log bytes because the shared log buffer was full.\n", droppedBytes);
+        printf("Dropped %ld injected log bytes because the shared log buffer was full.\n", droppedBytes);
     }
 }
 
