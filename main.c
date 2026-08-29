@@ -472,8 +472,6 @@ int main(int argc, char** argv)
     printf("Main injector process waiting...\n");
     WaitForSingleObject(remoteProcInfo.remoteProcHdl, INFINITE);
 
-    printf("Main injector process: Peace Out.\n");
-
 cleanup:
     if (g_logPumpState.stopEvent)
     {
@@ -490,6 +488,7 @@ cleanup:
     {
         CloseHandle(g_logPumpState.stopEvent);
     }
+    DrainInjectedLogs(&g_logPumpState);
     if (g_logPumpState.logFileMem)
     {
         FlushViewOfFile(g_logPumpState.logFileMem, (SIZE_T)g_logPumpState.logFileOffset);
@@ -523,6 +522,7 @@ cleanup:
     {
         CloseHandle(remoteProcInfo.remoteProcHdl);
     }
+    printf("Main injector process: Peace Out.\n");
 
     return exitCode;
 }

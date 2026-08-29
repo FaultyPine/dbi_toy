@@ -1,5 +1,8 @@
 
 // this is a shared lib that is injected into the remote process and is in charge of instrumenting the process it is injected into
+// it uses Zydis for disassembly, and DynAsm to emit instuctions
+// for DynAsm docs, see
+// https://corsix.github.io/dynasm-doc/instructions.html
 
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
@@ -160,7 +163,7 @@ typedef struct
     uint8_t* cursor;
 } CodeCursor;
 
-#define DBI_CODE_CACHE_SIZE (10 * MB)
+#define DBI_CODE_CACHE_SIZE (50 * MB)
 #define DBI_LOG_COMPILATION_VERBOSE 1
 
 static ThreadHijackState g_hijackedThreadState;
@@ -1259,6 +1262,29 @@ bool CompileBlockTerminator(
             // static memory indirect call EX: "call [0x00007FF6327770A8]"
             else if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
             {
+                if (operands[0].mem.base != ZYDIS_REGISTER_RIP && operands[0].mem.base != ZYDIS_REGISTER_NONE)
+                {
+                    // target address is stored in a register
+                    ZydisRegister jumpReg = operands[0].mem.base;
+                    int jumpRegIndex = 0;
+                    if (!ZydisRegisterToDbiGprIndex(jumpReg, &jumpRegIndex))
+                    {
+                        PeonyLogf("Unsupported memory-register call at %p", (void*)currentPC);
+                        return false;
+                    }
+                    int offset = operands[0].mem.disp.value;
+
+                    DbiEmitPush(Dst, nextSeqAppPC);
+                    | push DBI_DISPATCH_REG
+                    // because of the two pushes above, the stack pointer will have shifted, so any sp-relative memory reads need to be offset by the extra pushes we did here
+                    if (NormalizeGprRegister(jumpReg) == ZYDIS_REGISTER_RSP)
+                    {
+                        offset += 16;
+                    }
+                    | mov DBI_DISPATCH_REG, [Rq(jumpRegIndex)+offset]
+                    DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
+                    return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+                }
                 if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &targetAddress)))
                 {
                     PeonyLogf("Failed to resolve call jump target at %p", (void*)currentPC);

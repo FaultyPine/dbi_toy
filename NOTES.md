@@ -31,7 +31,7 @@ zydis points out in their readme that this is a nice zydis wrapper (but uses c++
 
 I should use this!  https://github.com/LuaJIT/LuaJIT/tree/v2.1/dynasm
                 really clever C machine code emitter where you can kinda put emit inline assembly directly inside C
-
+https://corsix.github.io/dynasm-doc/instructions.html
 
 
 Simple way to keep control of a thread in a DBI is to emit "exits" that still jump into our code cache.
