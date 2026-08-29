@@ -14,27 +14,40 @@
 #define ZYCORE_LIB ZYDIS_BUILD "/zycore/" ZYDIS_CONFIG "/Zycore.lib"
 #define MIMALLOC_ROOT "external/mimalloc"
 
-static bool require_file(const char *path, const char *message)
+static bool require_file(const char *path)
 {
     if (nob_file_exists(path)) return true;
-    nob_log(NOB_ERROR, "%s", message);
+    nob_log(NOB_ERROR, "missing required file: `%s`", path);
     return false;
 }
 
-static bool ensure_zydis(void)
+int main(int argc, char **argv)
 {
-    if (nob_file_exists(ZYDIS_LIB) && nob_file_exists(ZYCORE_LIB)) return true;
+    NOB_GO_REBUILD_URSELF_PLUS(argc, argv, "external/nob.h");
 
-    if (!nob_file_exists(ZYDIS_ROOT "/CMakeLists.txt")) {
-        nob_log(NOB_ERROR, "missing Zydis checkout at `%s`", ZYDIS_ROOT);
-        nob_log(NOB_ERROR, "run: git submodule update --init --recursive");
-        return false;
+#ifndef _WIN32
+    nob_log(NOB_ERROR, "this project currently builds only on Windows");
+    return 1;
+#endif
+
+    if (!nob_mkdir_if_not_exists(BUILD_DIR)) return 1;
+
+    bool missingFiles = false;
+    missingFiles |= !require_file(ZYDIS_ROOT "/CMakeLists.txt");
+    missingFiles |= !require_file(DYNASM_LUA);
+    missingFiles |= !require_file(MIMALLOC_ROOT "/src/static.c");
+    if (missingFiles)
+    {
+        nob_log(NOB_ERROR, "missing dependency files; run: git submodule update --init --recursive");
+        return 1;
     }
 
-    nob_log(NOB_INFO, "building Zydis static libraries");
+    bool needsZydisBuild = !nob_file_exists(ZYDIS_LIB) || !nob_file_exists(ZYCORE_LIB);
+    bool needsMiniluaBuild = !nob_file_exists(MINILUA);
 
-    Nob_Cmd cmd = {0};
-    nob_cmd_append(&cmd,
+    // zydis configure
+    Nob_Cmd zydisConfigure = {0};
+    nob_cmd_append(&zydisConfigure,
                    "cmake",
                    "-S", ZYDIS_ROOT,
                    "-B", ZYDIS_BUILD,
@@ -44,65 +57,41 @@ static bool ensure_zydis(void)
                    "-DZYDIS_BUILD_TESTS=OFF",
                    "-DZYDIS_BUILD_DOXYGEN=OFF",
                    "-DZYDIS_BUILD_SHARED_LIB=OFF");
-    if (!nob_cmd_run(&cmd)) return false;
 
-    nob_cmd_append(&cmd,
+    // zydis
+    Nob_Cmd zydis = {0};
+    nob_cmd_append(&zydis,
                    "cmake",
                    "--build", ZYDIS_BUILD,
                    "--config", ZYDIS_CONFIG,
                    "--target", "Zydis");
-    if (!nob_cmd_run(&cmd)) return false;
 
-    if (!nob_file_exists(ZYDIS_LIB)) {
-        nob_log(NOB_ERROR, "expected Zydis library was not produced: `%s`", ZYDIS_LIB);
-        return false;
-    }
-    if (!nob_file_exists(ZYCORE_LIB)) {
-        nob_log(NOB_ERROR, "expected Zycore library was not produced: `%s`", ZYCORE_LIB);
-        return false;
-    }
-
-    return true;
-}
-
-static bool build_minilua(void)
-{
-    if (nob_file_exists(MINILUA)) return true;
-
-    Nob_Cmd cmd = {0};
-    nob_cmd_append(&cmd,
+    // minilua
+    Nob_Cmd minilua = {0};
+    nob_cmd_append(&minilua,
                    CLANG,
                    "external/LuaJIT/src/host/minilua.c",
                    "-o", MINILUA,
                    "-O2",
                    "-D_CRT_SECURE_NO_WARNINGS");
-    return nob_cmd_run(&cmd);
-}
 
-static bool run_dynasm(void)
-{
-    Nob_Cmd cmd = {0};
-    nob_cmd_append(&cmd,
+    // dynasm
+    Nob_Cmd dynasm = {0};
+    nob_cmd_append(&dynasm,
                    MINILUA,
                    DYNASM_LUA,
                    //"-L", // --nolineno   defining this means no source code line information emitted. Meant for release builds. 
                    "-I", "external/LuaJIT/dynasm",
                    "-o", DYNASM_INJECTION_C,
                    "injection.c");
-    return nob_cmd_run(&cmd);
-}
 
-static bool build_main(void)
-{
-    Nob_Cmd cmd = {0};
-    nob_cmd_append(&cmd, CLANG, "main.c", "-o", BUILD_DIR "/main.exe", "-g");
-    return nob_cmd_run(&cmd);
-}
+    // main control program
+    Nob_Cmd mainProgram = {0};
+    nob_cmd_append(&mainProgram, CLANG, "main.c", "-o", BUILD_DIR "/main.exe", "-g");
 
-static bool build_injection(void)
-{
-    Nob_Cmd cmd = {0};
-    nob_cmd_append(&cmd,
+    // injection dll
+    Nob_Cmd injection = {0};
+    nob_cmd_append(&injection,
                    CLANG,
                    DYNASM_INJECTION_C,
                    "-o", BUILD_DIR "/injection.dll",
@@ -125,35 +114,28 @@ static bool build_injection(void)
                    "-I.",
                    "-I" MIMALLOC_ROOT "/include",
                    "-Iexternal/LuaJIT/dynasm");
-    return nob_cmd_run(&cmd);
-}
 
-static bool build_tester(void)
-{
-    Nob_Cmd cmd = {0};
-    nob_cmd_append(&cmd, CLANG, "tester.c", "-o", BUILD_DIR "/tester.exe", "-g", "-luser32");
-    return nob_cmd_run(&cmd);
-}
+    // tester
+    Nob_Cmd tester = {0};
+    nob_cmd_append(&tester, CLANG, "tester.c", "-o", BUILD_DIR "/tester.exe", "-g", "-luser32");
 
-int main(int argc, char **argv)
-{
-    NOB_GO_REBUILD_URSELF_PLUS(argc, argv, "external/nob.h");
-
-#ifndef _WIN32
-    nob_log(NOB_ERROR, "this project currently builds only on Windows");
-    return 1;
-#endif
-
-    if (!nob_mkdir_if_not_exists(BUILD_DIR)) return 1;
-
-    if (!require_file(DYNASM_LUA, "missing LuaJIT DynASM checkout, make sure you've pulled in the git submodules")) return 1;
-    if (!require_file(MIMALLOC_ROOT "/src/static.c", "missing mimalloc checkout, make sure you've pulled in the git submodules")) return 1;
-    if (!build_minilua()) return 1;
-    if (!ensure_zydis()) return 1;
-    if (!run_dynasm()) return 1;
-    if (!build_main()) return 1;
-    if (!build_injection()) return 1;
-    if (!build_tester()) return 1;
+    if (needsZydisBuild && !nob_cmd_run(&zydisConfigure)) return 1;
+    if (needsZydisBuild && !nob_cmd_run(&zydis)) return 1;
+    if (!nob_file_exists(ZYDIS_LIB))
+    {
+        nob_log(NOB_ERROR, "expected Zydis library was not produced: `%s`", ZYDIS_LIB);
+        return 1;
+    }
+    if (!nob_file_exists(ZYCORE_LIB))
+    {
+        nob_log(NOB_ERROR, "expected Zycore library was not produced: `%s`", ZYCORE_LIB);
+        return 1;
+    }
+    if (needsMiniluaBuild && !nob_cmd_run(&minilua)) return 1;
+    if (!nob_cmd_run(&dynasm)) return 1;
+    if (!nob_cmd_run(&mainProgram)) return 1;
+    if (!nob_cmd_run(&injection)) return 1;
+    if (!nob_cmd_run(&tester)) return 1;
 
     nob_log(NOB_INFO, "build succeeded");
     return 0;
