@@ -117,7 +117,7 @@ int main(int argc, char **argv)
 
     // tester
     Nob_Cmd tester = {0};
-    nob_cmd_append(&tester, CLANG, "tester.c", "-o", BUILD_DIR "/tester.exe", "-g", "-luser32");
+    nob_cmd_append(&tester, CLANG, "tester.c", "-o", BUILD_DIR "/tester.exe", "-g", "-O2", "-luser32");
 
     if (needsZydisBuild && !nob_cmd_run(&zydisConfigure)) return 1;
     if (needsZydisBuild && !nob_cmd_run(&zydis)) return 1;

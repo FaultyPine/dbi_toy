@@ -1407,6 +1407,28 @@ bool CompileBlockTerminator(
             // static memory indirect jmp EX: "jmp [0x00007FF6327770A8]"
             else if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
             {
+                if (operands[0].mem.base != ZYDIS_REGISTER_RIP && operands[0].mem.base != ZYDIS_REGISTER_NONE)
+                {
+                    // target address is stored in a register
+                    ZydisRegister jumpReg = operands[0].mem.base;
+                    int jumpRegIndex = 0;
+                    if (!ZydisRegisterToDbiGprIndex(jumpReg, &jumpRegIndex))
+                    {
+                        PeonyLogf("Unsupported memory-register uncond br at %p", (void*)currentPC);
+                        return false;
+                    }
+                    int offset = operands[0].mem.disp.value;
+                    
+                    | push DBI_DISPATCH_REG
+                    // because of the pushes above, the stack pointer will have shifted, so any sp-relative memory reads need to be offset by the extra pushes we did here
+                    if (NormalizeGprRegister(jumpReg) == ZYDIS_REGISTER_RSP)
+                    {
+                        offset += 8;
+                    }
+                    | mov DBI_DISPATCH_REG, [Rq(jumpRegIndex)+offset]
+                    DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
+                    return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+                }
                 if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &targetAddress)))
                 {
                     PeonyLogf("Failed to resolve direct branch target at %p", (void*)currentPC);
