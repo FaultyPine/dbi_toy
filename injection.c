@@ -1505,6 +1505,7 @@ bool CompileBlockTerminator(
             DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
             return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
         } break;
+        case ZYDIS_CATEGORY_INTERRUPT:
         case ZYDIS_CATEGORY_SYSCALL:
         {
             if (!EmitAndPossiblyRelocateInstruction(cursor, Dst, currentPC, instr, operands))
