@@ -28,6 +28,7 @@ typedef struct
     int pid;
     DWORD targetThreadId;
     char exeName[MAX_PATH];
+    char runPath[MAX_PATH];
 } GlobalState;
 
 GlobalState g_state;
@@ -226,6 +227,7 @@ DWORD WINAPI InjectedLogPumpThread(LPVOID param)
 #define DECLARE_CMDLINE_ARGS \
     X(pid, ParsePid) \
     X(exename, ParseExeName) \
+    X(run, ParseRunPath) \
     X(targetThreadId, ParseTargetThreadId)
 
 typedef enum
@@ -257,6 +259,11 @@ void ParsePid(const char* content)
 void ParseExeName(const char* content)
 {
     strncpy_s(g_state.exeName, sizeof(g_state.exeName), content, MAX_PATH);
+}
+
+void ParseRunPath(const char* content)
+{
+    strncpy_s(g_state.runPath, sizeof(g_state.runPath), content, MAX_PATH);
 }
 
 void ParseTargetThreadId(const char* content)
@@ -382,9 +389,11 @@ int main(int argc, char** argv)
 {
     memset(&g_state, 0, sizeof(g_state));
     int exitCode = 0;
+    PROCESS_INFORMATION launchedProcess = {0};
+    bool launchedProcessResumed = false;
+    RemoteProcInfo remoteProcInfo = {0};
 
-    int cmdlineArgsMask = 0;
-    for (int i = 0; i < argc; i++)
+    for (int i = 1; i < argc; i++)
     {
         const char* arg = argv[i];
         arg = EatChars(arg, "--");
@@ -392,15 +401,46 @@ int main(int argc, char** argv)
         {
             if (strcmp(arg, CmdlineArgToString(cmdlineArg)) == 0)
             {
+                if (i + 1 >= argc)
+                {
+                    printf("Missing value for --%s.\n", CmdlineArgToString(cmdlineArg));
+                    return 1;
+                }
                 cmdlineParsers[cmdlineArg](argv[i+1]);
                 i++;
-                cmdlineArgsMask |= (1 << i);
                 break;
             }
         }
     }
 
-    if (g_state.pid == 0 && g_state.exeName[0] != '\0')
+    if (g_state.runPath[0] != '\0')
+    {
+        STARTUPINFOA startupInfo = {0};
+        startupInfo.cb = sizeof(startupInfo);
+        if (!CreateProcessA(
+                g_state.runPath,
+                NULL,
+                NULL,
+                NULL,
+                FALSE,
+                CREATE_SUSPENDED,
+                NULL,
+                NULL,
+                &startupInfo,
+                &launchedProcess))
+        {
+            printf("CreateProcessA(\"%s\") failed: %lu\n", g_state.runPath, GetLastError());
+            return 1;
+        }
+
+        g_state.pid = (int)launchedProcess.dwProcessId;
+        if (g_state.targetThreadId == 0)
+        {
+            g_state.targetThreadId = launchedProcess.dwThreadId;
+        }
+        printf("Started \"%s\" suspended.\n", g_state.runPath);
+    }
+    else if (g_state.pid == 0 && g_state.exeName[0] != '\0')
     {
         g_state.pid = (int)WaitForPidByExeName(g_state.exeName);
     }
@@ -429,7 +469,8 @@ int main(int argc, char** argv)
         if (logFile == INVALID_HANDLE_VALUE)
         {
             printf("CreateFile for logfile failed (%lu).\n", GetLastError());
-            return 0;
+            exitCode = 1;
+            goto cleanup;
         }
 
         g_logPumpState.log = sharedLog;
@@ -440,7 +481,8 @@ int main(int argc, char** argv)
             printf("Initial logfile mapping failed (%lu).\n", GetLastError());
             CloseHandle(logFile);
             memset(&g_logPumpState, 0, sizeof(g_logPumpState));
-            return 0;
+            exitCode = 1;
+            goto cleanup;
         }
 
         g_logPumpState.stopEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -456,11 +498,16 @@ int main(int argc, char** argv)
 #endif
 
     SharedCommsObject* sharedComms = SharedCommsInitialize();
+    if (!sharedComms)
+    {
+        exitCode = 1;
+        goto cleanup;
+    }
     *sharedComms = (SharedCommsObject){0};
     sharedComms->targetThreadId = g_state.targetThreadId;
 
     const char* injectionDllFile = "injection.dll";
-    RemoteProcInfo remoteProcInfo = InjectCodeIntoProcess(g_state.pid, injectionDllFile);
+    remoteProcInfo = InjectCodeIntoProcess(g_state.pid, injectionDllFile);
     if (!remoteProcInfo.remoteProcHdl)
     {
         printf("Main injector process: attach failed.\n");
@@ -468,10 +515,42 @@ int main(int argc, char** argv)
         goto cleanup;
     }
 
+    if (launchedProcess.hThread)
+    {
+        if (WaitForSingleObject(remoteProcInfo.remoteThreadHdl, INFINITE) != WAIT_OBJECT_0)
+        {
+            printf("Waiting for DBI load failed: %lu\n", GetLastError());
+            exitCode = 1;
+            goto cleanup;
+        }
+
+        DWORD loadResult = 0;
+        if (!GetExitCodeThread(remoteProcInfo.remoteThreadHdl, &loadResult) || loadResult == 0)
+        {
+            printf("Loading the DBI DLL failed: %lu\n", GetLastError());
+            exitCode = 1;
+            goto cleanup;
+        }
+
+        printf("DBI loaded; resuming target process.\n");
+        if (ResumeThread(launchedProcess.hThread) == (DWORD)-1)
+        {
+            printf("ResumeThread failed: %lu\n", GetLastError());
+            exitCode = 1;
+            goto cleanup;
+        }
+        launchedProcessResumed = true;
+    }
+
     printf("Main injector process waiting...\n");
     WaitForSingleObject(remoteProcInfo.remoteProcHdl, INFINITE);
 
 cleanup:
+    if (launchedProcess.hThread && !launchedProcessResumed)
+    {
+        printf("DBI attach failed; resuming target process without instrumentation.\n");
+        ResumeThread(launchedProcess.hThread);
+    }
     if (g_logPumpState.stopEvent)
     {
         SetEvent(g_logPumpState.stopEvent);
@@ -520,6 +599,14 @@ cleanup:
     if (remoteProcInfo.remoteProcHdl)
     {
         CloseHandle(remoteProcInfo.remoteProcHdl);
+    }
+    if (launchedProcess.hThread)
+    {
+        CloseHandle(launchedProcess.hThread);
+    }
+    if (launchedProcess.hProcess)
+    {
+        CloseHandle(launchedProcess.hProcess);
     }
     printf("Main injector process: Peace Out.\n");
 
