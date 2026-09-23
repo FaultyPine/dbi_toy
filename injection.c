@@ -170,10 +170,13 @@ static mi_heap_t* g_dbiHeap;
 typedef struct
 {
     uint8_t* cursor;
+    signed long long size;
+    size_t capacity;
 } CodeCursor;
 
 #define DBI_CODE_CACHE_SIZE (150 * MB)
 #define DBI_LOG_COMPILATION_VERBOSE 0
+#define CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE 4096
 
 static ThreadHijackState g_hijackedThreadState;
 static SharedLogObject* g_sharedLog;
@@ -288,10 +291,12 @@ static bool IsRel32Reachable(uintptr_t fromNextRip, uintptr_t target)
     return delta >= INT32_MIN && delta <= INT32_MAX;
 }
 
-static bool X64EmitBytes(uint8_t** out, const void* bytes, size_t length)
+static bool X64EmitBytes(CodeCursor* cursor, const void* bytes, size_t length)
 {
-    memcpy(*out, bytes, length);
-    *out += length;
+    memcpy(cursor->cursor, bytes, length);
+    cursor->cursor += length;
+    cursor->size -= length;
+    assert(cursor->size > 0);
     return true;
 }
 
@@ -770,6 +775,8 @@ static bool DbiDynasmEncodeSnippet(dasm_State** Dst, CodeCursor* cursor, ExitPat
     }
 
     cursor->cursor += size;
+    cursor->size -= size;
+    assert(cursor->size > 0);
     return true;
 }
 
@@ -863,6 +870,7 @@ static void CodeCachePublishBlock(uintptr_t appPc, uintptr_t appEndPc, uint8_t* 
     };
     hmput(g_codeCache.entries, appPc, block);
     CodeCachePatchPendingExits(appPc, blockStart);
+    g_codeCache.used -= CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE - block.codeCacheBytes;
 }
 
 // tries to initialize code cache memory within rel32 range of 'nearPc'
@@ -938,7 +946,7 @@ uint8_t* CodeCacheReserve(size_t bytes)
 {
     if (g_codeCache.used + bytes > g_codeCache.capacity)
     {
-        PeonyLogf("Code cache is full!\n");
+        PeonyLogf("Code cache is full! capacity = %llu\n", g_codeCache.capacity);
         return NULL;
     }
     uint8_t* result = g_codeCache.base + g_codeCache.used;
@@ -1058,7 +1066,7 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, dasm_State** MainDst
     bool isRipRelativeMemoryOperand = GetRipRelativeMemoryOp(instr, operands, 0, 0);
     if (!isRipRelativeMemoryOperand)
     {
-        return X64EmitBytes(&cursor->cursor, (void*)appPc, instr->length);
+        return X64EmitBytes(cursor, (void*)appPc, instr->length);
     }
 
     // preparing to emit relocated instruction
@@ -1542,7 +1550,7 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
         goto error;
     }
 
-    size_t reserveSize = 4096;
+    size_t reserveSize = CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE;
     uint8_t* blockStart = CodeCacheReserve(reserveSize);
     if (!blockStart)
     {
@@ -1571,7 +1579,7 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
 
     uint64_t currentPC = appPc;
     // code emitting "cursor". this points to the code cache we need to write the jitted instructions to
-    CodeCursor codeOut = {.cursor = blockStart}; 
+    CodeCursor codeOut = {.cursor = blockStart, .size = reserveSize, .capacity = reserveSize}; 
 
 #if DBI_LOG_COMPILATION_VERBOSE
     PeonyLogf("Compiling basic block at %p -> %p", (void*)appPc, blockStart);
@@ -1620,7 +1628,7 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
 #if DBI_LOG_COMPILATION_VERBOSE
     LogCompiledBasicBlockComparison(&decoder, &fmt, appPc, currentPC, blockStart, codeOut.cursor);
 #endif
-    PeonyLogf("There are now %llu entries in the code cache", (unsigned long long)hmlenu(g_codeCache.entries));
+    PeonyLogf("There are now %llu entries in the code cache. code cache usage = %f%%", (unsigned long long)hmlenu(g_codeCache.entries), (double)g_codeCache.used / (double)g_codeCache.capacity);
 
     // return the code cache, so now the program will be executing in our instrumented code
     arrfree(patchLabels);
