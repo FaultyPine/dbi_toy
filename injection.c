@@ -172,8 +172,8 @@ typedef struct
     uint8_t* cursor;
 } CodeCursor;
 
-#define DBI_CODE_CACHE_SIZE (50 * MB)
-#define DBI_LOG_COMPILATION_VERBOSE 1
+#define DBI_CODE_CACHE_SIZE (150 * MB)
+#define DBI_LOG_COMPILATION_VERBOSE 0
 
 static ThreadHijackState g_hijackedThreadState;
 static SharedLogObject* g_sharedLog;
@@ -1325,12 +1325,12 @@ bool CompileBlockTerminator(
                 }
                 return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
-            // static memory indirect call EX: "call [0x00007FF6327770A8]"
+            // memory indirect call EX: "call qword ptr [rip + 0x1234]"
             else if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
             {
                 if (operands[0].mem.base != ZYDIS_REGISTER_RIP && operands[0].mem.base != ZYDIS_REGISTER_NONE)
                 {
-                    // target address is stored in a register
+                    // register-addressed indirect call EX: "call qword ptr [rax + 8]"
                     ZydisRegister jumpReg = operands[0].mem.base;
                     int jumpRegIndex = 0;
                     if (!ZydisRegisterToDbiGprIndex(jumpReg, &jumpRegIndex))
@@ -1366,6 +1366,7 @@ bool CompileBlockTerminator(
                 DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
                 return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
+            // register indirect call EX: "call rax"
             else if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
             {
                 ZydisRegister jumpReg = operands[0].reg.value;
@@ -1395,12 +1396,12 @@ bool CompileBlockTerminator(
                 }
                 return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
-            // static memory indirect jmp EX: "jmp [0x00007FF6327770A8]"
+            // memory indirect jmp EX: "jmp qword ptr [rip + 0x1234]"
             else if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
             {
                 if (operands[0].mem.base != ZYDIS_REGISTER_RIP && operands[0].mem.base != ZYDIS_REGISTER_NONE)
                 {
-                    // target address is stored in a register
+                    // register-addressed indirect jmp EX: "jmp qword ptr [rax + 8]"
                     ZydisRegister jumpReg = operands[0].mem.base;
                     int jumpRegIndex = 0;
                     if (!ZydisRegisterToDbiGprIndex(jumpReg, &jumpRegIndex))
@@ -1425,7 +1426,9 @@ bool CompileBlockTerminator(
                     PeonyLogf("Failed to resolve direct branch target at %p", (void*)currentPC);
                     return false;
                 }
+                #if DBI_LOG_COMPILATION_VERBOSE
                 PeonyLogf("memory uncondbr targetAddress = %p  nextSeqAppPC = %p currentPC = %p", targetAddress, nextSeqAppPC, currentPC);
+                #endif
                 // the emitexit call will always pop dispatch_reg back
                 | push DBI_DISPATCH_REG
                 | mov64 DBI_DISPATCH_REG, targetAddress
@@ -1438,6 +1441,7 @@ bool CompileBlockTerminator(
                 DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
                 return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
+            // register indirect jmp EX: "jmp rax"
             else if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
             {
                 ZydisRegister jumpReg = operands[0].reg.value;

@@ -506,14 +506,34 @@ int main(int argc, char** argv)
     *sharedComms = (SharedCommsObject){0};
     sharedComms->targetThreadId = g_state.targetThreadId;
 
-    const char* injectionDllFile = "injection.dll";
-    remoteProcInfo = InjectCodeIntoProcess(g_state.pid, injectionDllFile);
+    char injectionDllPath[MAX_PATH];
+    DWORD executablePathLength = GetModuleFileNameA(NULL, injectionDllPath, sizeof(injectionDllPath));
+    if (executablePathLength == 0 || executablePathLength >= sizeof(injectionDllPath))
+    {
+        printf("Failed to get injector executable path: %lu\n", GetLastError());
+        exitCode = 1;
+        goto cleanup;
+    }
+
+    #define INJECTION_DLL_NAME "injection.dll" 
+    char* executableName = strrchr(injectionDllPath, '\\');
+    if (!executableName ||
+        (size_t)(executableName - injectionDllPath) + sizeof("\\" INJECTION_DLL_NAME) > sizeof(injectionDllPath))
+    {
+        printf("Failed to construct injection DLL path\n");
+        exitCode = 1;
+        goto cleanup;
+    }
+    strcpy_s(executableName + 1, sizeof(injectionDllPath) - (size_t)(executableName + 1 - injectionDllPath), INJECTION_DLL_NAME);
+
+    remoteProcInfo = InjectCodeIntoProcess(g_state.pid, injectionDllPath);
     if (!remoteProcInfo.remoteProcHdl)
     {
         printf("Main injector process: attach failed.\n");
         exitCode = 1;
         goto cleanup;
     }
+    printf("Injected %s into remote process\n", injectionDllPath);
 
     if (launchedProcess.hThread)
     {
@@ -527,7 +547,7 @@ int main(int argc, char** argv)
         DWORD loadResult = 0;
         if (!GetExitCodeThread(remoteProcInfo.remoteThreadHdl, &loadResult) || loadResult == 0)
         {
-            printf("Loading the DBI DLL failed: %lu\n", GetLastError());
+            printf("Loading the DBI DLL failed\n");
             exitCode = 1;
             goto cleanup;
         }
@@ -543,7 +563,25 @@ int main(int argc, char** argv)
     }
 
     printf("Main injector process waiting...\n");
-    WaitForSingleObject(remoteProcInfo.remoteProcHdl, INFINITE);
+    DWORD targetWaitResult = WaitForSingleObject(remoteProcInfo.remoteProcHdl, INFINITE);
+    if (targetWaitResult != WAIT_OBJECT_0)
+    {
+        printf("Waiting for target process failed: %lu\n", GetLastError());
+        exitCode = 1;
+    }
+    else
+    {
+        DWORD targetExitCode = 0;
+        if (GetExitCodeProcess(remoteProcInfo.remoteProcHdl, &targetExitCode))
+        {
+            printf("Target process exited with code 0x%08lX (%lu)\n", targetExitCode, targetExitCode);
+        }
+        else
+        {
+            printf("Failed to get target process exit code: %lu\n", GetLastError());
+            exitCode = 1;
+        }
+    }
 
 cleanup:
     if (launchedProcess.hThread && !launchedProcessResumed)
@@ -557,9 +595,7 @@ cleanup:
     }
     if (logPumpThread)
     {
-        // i'd rather the app quit fast than wait for potentially slow log pumping. 
-        // i know that's "bad" but while it's a small personal proj i prefer speed over correctness
-        WaitForSingleObject(logPumpThread, 16); 
+        WaitForSingleObject(logPumpThread, 10 * 1000); // wait a couple seconds for logs to drain 
         CloseHandle(logPumpThread);
     }
     if (g_logPumpState.stopEvent)
