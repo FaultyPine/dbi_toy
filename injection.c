@@ -1309,14 +1309,6 @@ bool CompileBlockTerminator(
     
     switch (instr->meta.category)
     {
-        // BOOKMARK: still need to support memory targets, rip-relative memory targets, register targets
-        //      for both uncond br and call
-        // Types of jump targets
-        // - rip-relative static address
-        // - rip-relative memory
-        // - static memory
-        // - register
-        
         case ZYDIS_CATEGORY_CALL:
         {
             // direct call EX: "call 0x00007FF6327770A8"
@@ -1371,7 +1363,6 @@ bool CompileBlockTerminator(
                 | mov64 DBI_DISPATCH_REG, targetAddress
                 | mov DBI_DISPATCH_REG, qword [DBI_DISPATCH_REG]
                 
-                // TODO: this is not currently backpatchable, but getting indirect jumps to be backpatchable is complicated.
                 DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
                 return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
@@ -1439,8 +1430,8 @@ bool CompileBlockTerminator(
                 | push DBI_DISPATCH_REG
                 | mov64 DBI_DISPATCH_REG, targetAddress
                 | mov DBI_DISPATCH_REG, qword [DBI_DISPATCH_REG]
-                // TODO: this is not currently backpatchable, but getting indirect jumps to be backpatchable is complicated.
-                // One way i'm seeing to do it is to emit little "inline" caches of the previous jump.
+                // TODO: backpatchable indirect jumps... but getting indirect jumps to be backpatchable is complicated.
+                // i'm hearing that the way to do it is to emit little "inline" caches of the previous jump.
                 // before the jump, we compare the current target address of the jump to the previous time we took this jump
                 // if they're the same, we read the "inline" cache (which is just a spare 8 bytes emitted in the instruction block itself) 
                 // to get the code cache location to jump to.
@@ -1887,7 +1878,6 @@ bool HijackThreadRip(DWORD targetThreadId)
     // as soon as the thread resumes, it'll run our hijack asm which eventually calls our C func OnDBIExit
     context.Rip = (DWORD64)(uintptr_t)DBIExitTrampoline;
 
-    // TODO: preallocate the code cache so we aren't doing reallocations inside instrumentation code (messes with CRT heaps)
     if (!CodeCacheInit(originalRip))
     {
         PeonyLogf("Failed to initialize code cache during injection attachment");
