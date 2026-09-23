@@ -43,13 +43,15 @@ SharedLogObject* SharedLogInitialize();
 SharedCommsObject* SharedCommsInitialize()
 {
     size_t mappingSize = sizeof(SharedCommsObject);
+    char mappingName[64];
+    snprintf(mappingName, sizeof(mappingName), "%s_%lu", sharedCommsMappingName, processId);
     HANDLE filemapping = CreateFileMapping(
         INVALID_HANDLE_VALUE,
         NULL,
         PAGE_READWRITE,
         0,
         mappingSize,
-        sharedCommsMappingName
+        mappingName
     );
     if (filemapping == NULL) 
     {
