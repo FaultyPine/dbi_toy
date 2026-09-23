@@ -174,7 +174,7 @@ typedef struct
     size_t capacity;
 } CodeCursor;
 
-#define DBI_CODE_CACHE_SIZE (150 * MB)
+#define DBI_CODE_CACHE_SIZE (10 * MB)
 #define DBI_LOG_COMPILATION_VERBOSE 0
 #define CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE 4096
 
