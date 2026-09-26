@@ -1167,6 +1167,7 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, dasm_State** MainDst
         return false;
     }
     cursor->cursor += encodedLength;
+    cursor->size -= encodedLength;
 
     if (neededLongjump)
     {
@@ -1632,7 +1633,7 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
 #if DBI_LOG_COMPILATION_VERBOSE
     LogCompiledBasicBlockComparison(&decoder, &fmt, appPc, currentPC, blockStart, codeOut.cursor);
 #endif
-    PeonyLogf("There are now %llu entries in the code cache. code cache usage = %f%%", (unsigned long long)hmlenu(g_codeCache.entries), (double)g_codeCache.used / (double)g_codeCache.capacity);
+    PeonyLogf("There are now %llu entries in the code cache. code cache usage = %f%%", (unsigned long long)hmlenu(g_codeCache.entries), ((double)g_codeCache.used / (double)g_codeCache.capacity) * 100.0f);
 
     // return the code cache, so now the program will be executing in our instrumented code
     arrfree(patchLabels);
