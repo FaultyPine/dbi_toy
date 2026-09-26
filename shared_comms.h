@@ -32,7 +32,7 @@ typedef struct
     char buffer[PEONY_LOG_BUFFER_SIZE];
 } SharedLogObject;
 
-SharedCommsObject* SharedCommsInitialize();
+SharedCommsObject* SharedCommsInitializeForProcess(DWORD processId);
 SharedLogObject* SharedLogInitialize();
 
 #ifdef PEONY_SHARED_COMMS_IMPLEMENTATION
@@ -40,7 +40,7 @@ SharedLogObject* SharedLogInitialize();
 #include <windows.h>
 #include <stdio.h>
 
-SharedCommsObject* SharedCommsInitialize()
+SharedCommsObject* SharedCommsInitializeForProcess(DWORD processId)
 {
     size_t mappingSize = sizeof(SharedCommsObject);
     char mappingName[64];

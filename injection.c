@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <TlHelp32.h>
 #include <dbghelp.h>
+#include <intrin.h>
 #include "Zydis.h"
 
 
@@ -84,24 +85,25 @@ static void DbiAllocatorFatalOutOfMemory(size_t size);
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "user32.lib")
 
+#define DBI_XSAVE_AREA_SIZE (16 * KB)
+
 typedef struct
 {
     DWORD64 originalR10;
     CONTEXT savedRegs;
-    _Alignas(16) uint8_t fpuState[512];
+    _Alignas(64) uint8_t xsaveArea[DBI_XSAVE_AREA_SIZE];
 } ThreadHijackState;
 
 #define SAVEDREGS_OFF_NUM 16
 #define SAVEDREGS_OFF STRINGIFY_MACRO(SAVEDREGS_OFF_NUM)
 #define ORIGR10_OFF_NUM 0
 #define ORIGR10_OFF STRINGIFY_MACRO(ORIGR10_OFF_NUM)
-#define FPUSTATE_OFF_NUM 1248
-#define FPUSTATE_OFF STRINGIFY_MACRO(FPUSTATE_OFF_NUM)
+#define XSAVE_AREA_OFF_NUM 1280
+#define XSAVE_AREA_OFF STRINGIFY_MACRO(XSAVE_AREA_OFF_NUM)
 _Static_assert(offsetof(ThreadHijackState, originalR10) == ORIGR10_OFF_NUM, "unexpected ThreadHijackState layout");
 _Static_assert(offsetof(ThreadHijackState, savedRegs) == SAVEDREGS_OFF_NUM, "unexpected ThreadHijackState layout");
-_Static_assert(offsetof(ThreadHijackState, fpuState) == FPUSTATE_OFF_NUM, "unexpected ThreadHijackState fpuState offset");
-_Static_assert((offsetof(ThreadHijackState, fpuState) % 16) == 0, "ThreadHijackState fpuState must be 16-byte aligned");
-_Static_assert(sizeof(((ThreadHijackState*)0)->fpuState) == 512, "FXSAVE area must be 512 bytes");
+_Static_assert(offsetof(ThreadHijackState, xsaveArea) == XSAVE_AREA_OFF_NUM, "unexpected ThreadHijackState xsaveArea offset");
+_Static_assert((offsetof(ThreadHijackState, xsaveArea) % 64) == 0, "ThreadHijackState xsaveArea must be 64-byte aligned");
 
 typedef struct 
 {
@@ -180,6 +182,8 @@ typedef struct
 
 static ThreadHijackState g_hijackedThreadState;
 static SharedLogObject* g_sharedLog;
+static uint32_t g_xsaveMaskLow;
+static uint32_t g_xsaveMaskHigh;
 
 #define DBI_ZYDIS_DISPATCH_REG ZYDIS_REGISTER_R11
 #define DBI_ZYDIS_STATE_REG ZYDIS_REGISTER_R10
@@ -1656,6 +1660,9 @@ __declspec(noinline)
 void OnDBIExit(ThreadHijackState* state)
 {
     uint64_t appTargetRip = state->savedRegs.Rip;
+    #if DBI_LOG_COMPILATION_VERBOSE
+    PeonyLogf("Dispatching to app PC %p", (void*)appTargetRip);
+    #endif
     uint8_t* codeCacheRip = DbiLookupOrCompile(appTargetRip);
     state->savedRegs.Rip = (DWORD64)codeCacheRip;
 }
@@ -1706,8 +1713,10 @@ void RestoreRegisters(void)
     __asm__(
         ".intel_syntax noprefix\n"
 
-        // Restore x87 FPU, MMX, XMM0-XMM15, and MXCSR. This does not restore AVX upper YMM/ZMM state.
-        "fxrstor64 [r10 + " FPUSTATE_OFF "]\n"
+        // extended state (including AVX YMM regs)
+        "mov eax, dword ptr [rip + g_xsaveMaskLow]\n"
+        "mov edx, dword ptr [rip + g_xsaveMaskHigh]\n"
+        "xrstor64 [r10 + " XSAVE_AREA_OFF "]\n"
 
         // cpu flags restore
         "mov eax, dword ptr [r10 + " SAVEDREGS_OFF " + " CTXOFFSET_RFLAGS "]\n" // rax = (uint32)state->savedRegs.EFlags
@@ -1750,11 +1759,13 @@ void SaveRegisters(void)
     // r10 should contain the ThreadHijackState
     __asm__(
         ".intel_syntax noprefix\n"
-        // Save x87 FPU, MMX, XMM0-XMM15, and MXCSR. This does not save AVX upper YMM/ZMM state.
-        "fxsave64 [r10 + " FPUSTATE_OFF "]\n"
-
-        // saving rax before clobber
+        // XSAVE uses RAX and RDX as its feature mask, so preserve those first
         "mov qword ptr [r10 + ("CTXOFFSET_RAX" + " SAVEDREGS_OFF ")], rax\n"
+        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RDX"], rdx\n"
+        "mov eax, dword ptr [rip + g_xsaveMaskLow]\n"
+        "mov edx, dword ptr [rip + g_xsaveMaskHigh]\n"
+        "xsave64 [r10 + " XSAVE_AREA_OFF "]\n"
+
         // r10 contains important state, we use rax as tmp to store it
         "mov rax, qword ptr [r10 + "ORIGR10_OFF"]\n"
         "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_R10"], rax\n"
@@ -1762,7 +1773,6 @@ void SaveRegisters(void)
         // *(r10 + offset) = register    where r10 is (char*)(ThreadHijackState*)
         // rax already saved
         "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RCX"], rcx\n"
-        "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RDX"], rdx\n"
         "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RBX"], rbx\n"
         "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RBP"], rbp\n"
         "mov qword ptr [r10 + " SAVEDREGS_OFF " + "CTXOFFSET_RSI"], rsi\n"
@@ -2003,14 +2013,57 @@ static LONG WINAPI PeonyUnhandledExceptionFilter(EXCEPTION_POINTERS* exceptionIn
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+
+static bool DbiInitializeExtendedState(void)
+{
+    int cpuid[4] = {};
+    __cpuidex(cpuid, 0, 0);
+    // can we even query xsave capabilities?
+    if ((uint32_t)cpuid[0] < 13)
+    {
+        PeonyLogf("CPU does not support CPUID leaf 13 for XSAVE");
+        return false;
+    }
+    
+    __cpuidex(cpuid, 1, 0);
+    // do we support xsave at all?
+    if (((uint32_t)cpuid[2] & ((1u << 26) | (1u << 27))) != ((1u << 26) | (1u << 27)))
+    {
+        PeonyLogf("CPU/OS does not support XSAVE");
+        return false;
+    }
+    
+    // what kind of xsave-ing do we need to do on this cpu?
+    // https://www.geoffchappell.com/studies/windows/km/cpu/cpuid/0000000dh/index.htm
+    uint64_t xcr0 = _xgetbv(0);
+    __cpuidex(cpuid, 13, 0);
+    uint64_t supportedMask = (uint32_t)cpuid[0] | ((uint64_t)(uint32_t)cpuid[3] << 32);
+    uint32_t xsaveSize = (uint32_t)cpuid[1];
+    uint64_t xsaveMask = xcr0 & supportedMask;
+    if (xsaveMask == 0 || xsaveSize > DBI_XSAVE_AREA_SIZE)
+    {
+        PeonyLogf("Unsupported XSAVE state mask=%llX size=%lu", xsaveMask, xsaveSize);
+        return false;
+    }
+
+    g_xsaveMaskLow = (uint32_t)xsaveMask;
+    g_xsaveMaskHigh = (uint32_t)(xsaveMask >> 32);
+    PeonyLogf("XSAVE enabled: mask=%llX size=%lu", xsaveMask, xsaveSize);
+    return true;
+}
+
 #define DEBUG_PICK_THREAD_CONTAINS_NAME "main"
 
 void Initialize()
 {
     SetUnhandledExceptionFilter(PeonyUnhandledExceptionFilter);
     PeonyLogf("Hello from injection dll! Zydis version = %llu", ZydisGetVersion());
+    if (!DbiInitializeExtendedState())
+    {
+        return;
+    }
     DWORD pid = GetProcessId(GetCurrentProcess());
-    SharedCommsObject* sharedComms = SharedCommsInitialize();
+    SharedCommsObject* sharedComms = SharedCommsInitializeForProcess(pid);
     if (!sharedComms)
     {
         return;

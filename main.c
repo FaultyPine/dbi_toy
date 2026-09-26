@@ -206,7 +206,7 @@ void DrainInjectedLogs(LogPumpState* state)
         printf("Dropped %ld injected log bytes because the shared log buffer was full.\n", droppedBytes);
     }
 }
-
+// TODO: https://codeberg.org/RafaGago/mini-async-log-c
 DWORD WINAPI InjectedLogPumpThread(LPVOID param)
 {
     LogPumpState* state = (LogPumpState*)param;
