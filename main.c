@@ -497,7 +497,7 @@ int main(int argc, char** argv)
     }
 #endif
 
-    SharedCommsObject* sharedComms = SharedCommsInitialize();
+    SharedCommsObject* sharedComms = SharedCommsInitializeForProcess(g_state.pid);
     if (!sharedComms)
     {
         exitCode = 1;

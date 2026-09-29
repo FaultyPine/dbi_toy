@@ -1324,6 +1324,8 @@ bool CompileBlockTerminator(
     {
         case ZYDIS_CATEGORY_CALL:
         {
+            // all flavors of call want the return address pushed on the stack
+            DbiEmitPush(Dst, nextSeqAppPC);
             // direct call EX: "call 0x00007FF6327770A8"
             if (GetDirectRelativeTarget(instr, operands, currentPC, &targetAddress))
             {
@@ -1331,7 +1333,6 @@ bool CompileBlockTerminator(
                 // we will be returning to this current (really, next) pc
                 // we dont want to clobber regs here, so we use this xchg trick on the stack 
                 // to make sure DBI_DISPATCH_REG is the same as before, and top of the stack has the return address (nextSeqAppPC)
-                DbiEmitPush(Dst, nextSeqAppPC);
                 if (!DbiEmitPatchableExit(Dst, targetAddress, patchLabels))
                 {
                     return false;
@@ -1353,7 +1354,6 @@ bool CompileBlockTerminator(
                     }
                     int offset = operands[0].mem.disp.value;
                     
-                    DbiEmitPush(Dst, nextSeqAppPC);
                     | push DBI_DISPATCH_REG
                     // because of the two pushes above, the stack pointer will have shifted, so any sp-relative memory reads need to be offset by the extra pushes we did here
                     if (NormalizeGprRegister(jumpReg) == ZYDIS_REGISTER_RSP)
@@ -1369,7 +1369,6 @@ bool CompileBlockTerminator(
                     PeonyLogf("Failed to resolve call jump target at %p", (void*)currentPC);
                     return false;
                 }
-                DbiEmitPush(Dst, nextSeqAppPC);
 
                 // the emitexit call will always pop dispatch_reg back
                 | push DBI_DISPATCH_REG
@@ -1389,7 +1388,6 @@ bool CompileBlockTerminator(
                     PeonyLogf("Unsupported register call at %p", (void*)currentPC);
                     return false;
                 }
-                DbiEmitPush(Dst, nextSeqAppPC);
 
                 | push DBI_DISPATCH_REG
                 | mov DBI_DISPATCH_REG, Rq(jumpRegIndex)
