@@ -176,9 +176,9 @@ typedef struct
     size_t capacity;
 } CodeCursor;
 
-#define DBI_CODE_CACHE_SIZE (10 * MB)
+#define DBI_CODE_CACHE_SIZE (100 * MB)
 #define DBI_LOG_COMPILATION_VERBOSE 0
-#define CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE 4096
+#define CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE (4096*5)
 
 static ThreadHijackState g_hijackedThreadState;
 static SharedLogObject* g_sharedLog;
@@ -874,6 +874,7 @@ static void CodeCachePublishBlock(uintptr_t appPc, uintptr_t appEndPc, uint8_t* 
     };
     hmput(g_codeCache.entries, appPc, block);
     CodeCachePatchPendingExits(appPc, blockStart);
+    // now that we know the real size of the code block, rather than the inital guess, reclaim the unused space
     g_codeCache.used -= CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE - block.codeCacheBytes;
 }
 
@@ -1249,6 +1250,91 @@ static void DbiEmitPush(dasm_State** Dst, uintptr_t returnAppPC)
     | xchg qword [rsp], DBI_DISPATCH_REG
 }
 
+// NOTE: DBI_DISPATCH_REG is expected to be saved on the stack before this. 
+// Resolves a non-RIP indirect branch target 
+static bool DbiEmitRegisterAddressedIndirectTarget(
+    dasm_State** Dst,
+    const ZydisDecodedOperand* operand,
+    int stackAdjustment)
+{
+    ZydisRegister baseReg = NormalizeGprRegister(operand->mem.base);
+    ZydisRegister indexReg = NormalizeGprRegister(operand->mem.index);
+    bool hasBase = baseReg != ZYDIS_REGISTER_NONE;
+    bool hasIndex = indexReg != ZYDIS_REGISTER_NONE;
+    int baseIndex = 0;
+    int indexIndex = 0;
+
+    if (!hasBase && !hasIndex)
+    {
+        return false;
+    }
+    if (hasBase && !ZydisRegisterToDbiGprIndex(baseReg, &baseIndex))
+    {
+        return false;
+    }
+    if (hasIndex && !ZydisRegisterToDbiGprIndex(indexReg, &indexIndex))
+    {
+        return false;
+    }
+
+    int64_t displacement = operand->mem.disp.value;
+    if (baseReg == ZYDIS_REGISTER_RSP)
+    {
+        displacement += stackAdjustment;
+    }
+
+    // dynasm needs these multipliers as literals, and dynasm currently runs before the C preprocessor does so hardcoding these here is simplest
+    if (hasBase && hasIndex)
+    {
+        switch (operand->mem.scale)
+        {
+            case 1:
+                | lea DBI_DISPATCH_REG, [Rq(baseIndex)+Rq(indexIndex)*1+displacement]
+                break;
+            case 2:
+                | lea DBI_DISPATCH_REG, [Rq(baseIndex)+Rq(indexIndex)*2+displacement]
+                break;
+            case 4:
+                | lea DBI_DISPATCH_REG, [Rq(baseIndex)+Rq(indexIndex)*4+displacement]
+                break;
+            case 8:
+                | lea DBI_DISPATCH_REG, [Rq(baseIndex)+Rq(indexIndex)*8+displacement]
+                break;
+            default:
+                PeonyLogf("Unsupported indirect branch scale %u", operand->mem.scale);
+                return false;
+        }
+    }
+    else if (hasBase)
+    {
+        | lea DBI_DISPATCH_REG, [Rq(baseIndex)+displacement]
+    }
+    else
+    {
+        switch (operand->mem.scale)
+        {
+            case 1:
+                | lea DBI_DISPATCH_REG, [Rq(indexIndex)*1+displacement]
+                break;
+            case 2:
+                | lea DBI_DISPATCH_REG, [Rq(indexIndex)*2+displacement]
+                break;
+            case 4:
+                | lea DBI_DISPATCH_REG, [Rq(indexIndex)*4+displacement]
+                break;
+            case 8:
+                | lea DBI_DISPATCH_REG, [Rq(indexIndex)*8+displacement]
+                break;
+            default:
+                PeonyLogf("Unsupported indirect branch scale %u", operand->mem.scale);
+                return false;
+        }
+    }
+    // lea loaded the address of the address into the dispatch reg, we need to dereference
+    | mov DBI_DISPATCH_REG, [DBI_DISPATCH_REG]
+    return true;
+}
+
 static bool DbiEmitJccToLabel1(dasm_State** Dst, ZydisMnemonic mnemonic)
 {
     switch (mnemonic)
@@ -1342,25 +1428,16 @@ bool CompileBlockTerminator(
             // memory indirect call EX: "call qword ptr [rip + 0x1234]"
             else if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
             {
-                if (operands[0].mem.base != ZYDIS_REGISTER_RIP && operands[0].mem.base != ZYDIS_REGISTER_NONE)
+                if (operands[0].mem.base != ZYDIS_REGISTER_RIP &&
+                    (operands[0].mem.base != ZYDIS_REGISTER_NONE || operands[0].mem.index != ZYDIS_REGISTER_NONE))
                 {
                     // register-addressed indirect call EX: "call qword ptr [rax + 8]"
-                    ZydisRegister jumpReg = operands[0].mem.base;
-                    int jumpRegIndex = 0;
-                    if (!ZydisRegisterToDbiGprIndex(jumpReg, &jumpRegIndex))
+                    | push DBI_DISPATCH_REG
+                    if (!DbiEmitRegisterAddressedIndirectTarget(Dst, &operands[0], 16))
                     {
                         PeonyLogf("Unsupported memory-register call at %p", (void*)currentPC);
                         return false;
                     }
-                    int offset = operands[0].mem.disp.value;
-                    
-                    | push DBI_DISPATCH_REG
-                    // because of the two pushes above, the stack pointer will have shifted, so any sp-relative memory reads need to be offset by the extra pushes we did here
-                    if (NormalizeGprRegister(jumpReg) == ZYDIS_REGISTER_RSP)
-                    {
-                        offset += 16;
-                    }
-                    | mov DBI_DISPATCH_REG, [Rq(jumpRegIndex)+offset]
                     DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
                     return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
                 }
@@ -1410,25 +1487,16 @@ bool CompileBlockTerminator(
             // memory indirect jmp EX: "jmp qword ptr [rip + 0x1234]"
             else if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
             {
-                if (operands[0].mem.base != ZYDIS_REGISTER_RIP && operands[0].mem.base != ZYDIS_REGISTER_NONE)
+                if (operands[0].mem.base != ZYDIS_REGISTER_RIP &&
+                    (operands[0].mem.base != ZYDIS_REGISTER_NONE || operands[0].mem.index != ZYDIS_REGISTER_NONE))
                 {
                     // register-addressed indirect jmp EX: "jmp qword ptr [rax + 8]"
-                    ZydisRegister jumpReg = operands[0].mem.base;
-                    int jumpRegIndex = 0;
-                    if (!ZydisRegisterToDbiGprIndex(jumpReg, &jumpRegIndex))
+                    | push DBI_DISPATCH_REG
+                    if (!DbiEmitRegisterAddressedIndirectTarget(Dst, &operands[0], 8))
                     {
                         PeonyLogf("Unsupported memory-register uncond br at %p", (void*)currentPC);
                         return false;
                     }
-                    int offset = operands[0].mem.disp.value;
-                    
-                    | push DBI_DISPATCH_REG
-                    // because of the pushes above, the stack pointer will have shifted, so any sp-relative memory reads need to be offset by the extra pushes we did here
-                    if (NormalizeGprRegister(jumpReg) == ZYDIS_REGISTER_RSP)
-                    {
-                        offset += 8;
-                    }
-                    | mov DBI_DISPATCH_REG, [Rq(jumpRegIndex)+offset]
                     DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
                     return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
                 }
