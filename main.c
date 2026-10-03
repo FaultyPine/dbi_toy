@@ -461,9 +461,6 @@ int main(int argc, char** argv)
     SharedLogObject* sharedLog = SharedLogInitialize();
     if (sharedLog)
     {
-        // SharedLogObject might hold a large buffer, so using a zero-assignment here can cause a stack overflow so we just 0 out the non-buffer members
-        memset(sharedLog, 0, offsetof(SharedLogObject, buffer));
-
         strncpy_s(sharedLog->outputLogFilename, sizeof(sharedLog->outputLogFilename), "PeonyLog.txt", sizeof(sharedLog->outputLogFilename));
         HANDLE logFile = CreateFile(sharedLog->outputLogFilename, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (logFile == INVALID_HANDLE_VALUE)
