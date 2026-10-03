@@ -50,6 +50,7 @@ static void* DbiRealloc(void* ptr, size_t size);
 static void DbiFree(void* ptr);
 static void DbiAllocatorFatalOutOfMemory(size_t size);
 
+// copied from dynasm_proto.h, but with my allocators
 #define DASM_M_GROW(ctx, t, p, sz, need) \
     do { \
         size_t _sz = (sz); \
