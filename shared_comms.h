@@ -27,16 +27,14 @@ typedef struct
     char outputLogFilename[MAX_PATH];
     HANDLE logFile;
     void* logFileMem;
-
-    // must be last
+    
     char buffer[PEONY_LOG_BUFFER_SIZE];
-    long initialized;
 } SharedLogObject;
 
 SharedCommsObject* SharedCommsInitializeForProcess(DWORD processId);
 SharedLogObject* SharedLogInitialize();
 
-#define PeonyLogf(...) _PeonyLogf(__FILE__, __VA_ARGS__)
+#define PeonyLogf(...) _PeonyLogf(__FILE__, __LINE__, __VA_ARGS__)
 
 extern SharedLogObject* g_sharedLog;
 
@@ -122,12 +120,6 @@ SharedLogObject* SharedLogInitialize()
     }
     
     SharedLogObject* sharedLog = (SharedLogObject*)sharedMem;
-    // null out the shared log only once across all processes that share it
-    if (!InterlockedCompareExchange(&sharedLog->initialized, true, false))
-    {
-        // SharedLogObject might hold a large buffer, so using a zero-assignment here can cause a stack overflow so we just 0 out the non-buffer members
-        memset(sharedLog, 0, offsetof(SharedLogObject, buffer));
-    }
     return sharedLog;
 }
 
@@ -188,36 +180,36 @@ void PeonyLogWrite(const char* bytes, int length)
     InterlockedExchange(&g_sharedLog->writeOffset, (writeOffset + length) % PEONY_LOG_BUFFER_SIZE);
 }
 
-void _PeonyLogf(const char* file, const char* format, ...)
+void _PeonyLogf(const char* file, uint32_t line, const char* format, ...)
 {
-    char line[1024];
-    int prefixLength = snprintf(line, sizeof(line), "[%s:%lu] ", file, GetCurrentThreadId());
+    char logline[1024];
+    int prefixLength = snprintf(logline, sizeof(logline), "[%s:%u(%lu)] ", file, line, GetCurrentThreadId());
     if (prefixLength < 0)
     {
         return;
     }
-    if (prefixLength >= (int)sizeof(line))
+    if (prefixLength >= (int)sizeof(logline))
     {
-        prefixLength = sizeof(line) - 1;
+        prefixLength = sizeof(logline) - 1;
     }
 
     va_list args;
     va_start(args, format);
-    int bodyLength = vsnprintf(line + prefixLength, sizeof(line) - prefixLength, format, args);
+    int bodyLength = vsnprintf(logline + prefixLength, sizeof(logline) - prefixLength, format, args);
     va_end(args);
 
     int totalLength = prefixLength;
     if (bodyLength > 0)
     {
-        int spaceLeft = (int)sizeof(line) - prefixLength;
+        int spaceLeft = (int)sizeof(logline) - prefixLength;
         totalLength += (bodyLength < spaceLeft) ? bodyLength : spaceLeft - 1;
     }
-    if (totalLength < (int)sizeof(line) - 1 && (totalLength == 0 || line[totalLength - 1] != '\n'))
+    if (totalLength < (int)sizeof(logline) - 1 && (totalLength == 0 || logline[totalLength - 1] != '\n'))
     {
-        line[totalLength++] = '\n';
-        line[totalLength] = 0;
+        logline[totalLength++] = '\n';
+        logline[totalLength] = 0;
     }
-    PeonyLogWrite(line, totalLength);
+    PeonyLogWrite(logline, totalLength);
 }
 
 
