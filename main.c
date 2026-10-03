@@ -150,7 +150,7 @@ void WriteMappedLogFileChunk(LogPumpState* state, const void* bytes, DWORD lengt
     if (!EnsureMappedLogFileCapacity(state, length))
     {
         DWORD error = GetLastError();
-        printf("Failed to grow injected log file mapping, err code = (%lu) NOTE! log bytes may be dropped.\n", error);
+        PeonyLogf("Failed to grow injected log file mapping, err code = (%lu) NOTE! log bytes may be dropped.\n", error);
 
         uint64_t remaining = (state->logFileOffset < state->logFileCapacity)
             ? (state->logFileCapacity - state->logFileOffset) : 0;
@@ -203,7 +203,7 @@ void DrainInjectedLogs(LogPumpState* state)
     LONG droppedBytes = InterlockedExchange(&log->droppedBytes, 0);
     if (droppedBytes > 0)
     {
-        printf("Dropped %ld injected log bytes because the shared log buffer was full.\n", droppedBytes);
+        PeonyLogf("Dropped %ld injected log bytes because the shared log buffer was full.\n", droppedBytes);
     }
 }
 // TODO: https://codeberg.org/RafaGago/mini-async-log-c
@@ -293,7 +293,7 @@ DWORD FindPidByExeName(const char* exeName)
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE)
     {
-        printf("CreateToolhelp32Snapshot failed: %lu\n", GetLastError());
+        PeonyLogf("CreateToolhelp32Snapshot failed: %lu\n", GetLastError());
         return 0;
     }
 
@@ -319,7 +319,7 @@ DWORD FindPidByExeName(const char* exeName)
 
 DWORD WaitForPidByExeName(const char* exeName)
 {
-    printf("Waiting for executable \"%s\"...\n", exeName);
+    PeonyLogf("Waiting for executable \"%s\"...\n", exeName);
     for (;;)
     {
         DWORD pid = FindPidByExeName(exeName);
@@ -340,14 +340,14 @@ RemoteProcInfo InjectCodeIntoProcess(int pid, const char* sharedLibPath)
         pid);
     if (remoteProc == NULL)
     {
-        printf("OpenProcess failed %lu. Does PID %i exist?\n", GetLastError(), pid);
+        PeonyLogf("OpenProcess failed %lu. Does PID %i exist?\n", GetLastError(), pid);
         return remoteProcInfo;
     }
 
     LPVOID remoteMem = VirtualAllocEx(remoteProc, NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (remoteMem == NULL)
     {
-        printf("VirtualAllocEx failed: %lu\n", GetLastError());
+        PeonyLogf("VirtualAllocEx failed: %lu\n", GetLastError());
         CloseHandle(remoteProc);
         return remoteProcInfo;
     }
@@ -355,7 +355,7 @@ RemoteProcInfo InjectCodeIntoProcess(int pid, const char* sharedLibPath)
     BOOL ret = WriteProcessMemory(remoteProc, remoteMem, sharedLibPath, strlen(sharedLibPath)+1, NULL);
     if (!ret)
     {
-        printf("WriteProcessMemory failed: %lu\n", GetLastError());
+        PeonyLogf("WriteProcessMemory failed: %lu\n", GetLastError());
         VirtualFreeEx(remoteProc, remoteMem, 0, MEM_RELEASE);
         CloseHandle(remoteProc);
         return remoteProcInfo;
@@ -364,7 +364,7 @@ RemoteProcInfo InjectCodeIntoProcess(int pid, const char* sharedLibPath)
     LPTHREAD_START_ROUTINE loadLibraryFn = (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandle("kernel32.dll"), "LoadLibraryA");
     if (!loadLibraryFn)
     {
-        printf("Failed to find LoadLibraryA: %lu\n", GetLastError());
+        PeonyLogf("Failed to find LoadLibraryA: %lu\n", GetLastError());
         VirtualFreeEx(remoteProc, remoteMem, 0, MEM_RELEASE);
         CloseHandle(remoteProc);
         return remoteProcInfo;
@@ -374,7 +374,7 @@ RemoteProcInfo InjectCodeIntoProcess(int pid, const char* sharedLibPath)
     HANDLE remoteThread = CreateRemoteThread(remoteProc, NULL, 0, loadLibraryFn, remoteMem, 0, NULL);
     if (remoteThread == NULL)
     {
-        printf("CreateRemoteThread failed: %lu\n", GetLastError());
+        PeonyLogf("CreateRemoteThread failed: %lu\n", GetLastError());
         VirtualFreeEx(remoteProc, remoteMem, 0, MEM_RELEASE);
         CloseHandle(remoteProc);
         return remoteProcInfo;
@@ -403,7 +403,7 @@ int main(int argc, char** argv)
             {
                 if (i + 1 >= argc)
                 {
-                    printf("Missing value for --%s.\n", CmdlineArgToString(cmdlineArg));
+                    PeonyLogf("Missing value for --%s.\n", CmdlineArgToString(cmdlineArg));
                     return 1;
                 }
                 cmdlineParsers[cmdlineArg](argv[i+1]);
@@ -429,7 +429,7 @@ int main(int argc, char** argv)
                 &startupInfo,
                 &launchedProcess))
         {
-            printf("CreateProcessA(\"%s\") failed: %lu\n", g_state.runPath, GetLastError());
+            PeonyLogf("CreateProcessA(\"%s\") failed: %lu\n", g_state.runPath, GetLastError());
             return 1;
         }
 
@@ -438,7 +438,7 @@ int main(int argc, char** argv)
         {
             g_state.targetThreadId = launchedProcess.dwThreadId;
         }
-        printf("Started \"%s\" suspended.\n", g_state.runPath);
+        PeonyLogf("Started \"%s\" suspended.\n", g_state.runPath);
     }
     else if (g_state.pid == 0 && g_state.exeName[0] != '\0')
     {
@@ -448,13 +448,13 @@ int main(int argc, char** argv)
     if (g_state.pid == 0)
     {
         // no pid supplied, we should prompt the user
-        printf("Enter PID to attach to: ");
+        PeonyLogf("Enter PID to attach to: ");
         char pidStr[50];
         fgets(pidStr, sizeof(pidStr), stdin);
         sscanf_s(pidStr, "%d", &g_state.pid);
     }
-    printf("PID = %i\n", g_state.pid);
-    printf("Target thread ID = %lu\n", g_state.targetThreadId);
+    PeonyLogf("PID = %i\n", g_state.pid);
+    PeonyLogf("Target thread ID = %lu\n", g_state.targetThreadId);
 
 #if PEONY_PUMP_INJECTED_LOGS
     HANDLE logPumpThread = NULL;
@@ -465,7 +465,7 @@ int main(int argc, char** argv)
         HANDLE logFile = CreateFile(sharedLog->outputLogFilename, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (logFile == INVALID_HANDLE_VALUE)
         {
-            printf("CreateFile for logfile failed (%lu).\n", GetLastError());
+            PeonyLogf("CreateFile for logfile failed (%lu).\n", GetLastError());
             exitCode = 1;
             goto cleanup;
         }
@@ -475,7 +475,7 @@ int main(int argc, char** argv)
         g_logPumpState.logFileOffset = 0;
         if (!EnsureMappedLogFileCapacity(&g_logPumpState, PEONY_LOG_FILE_CHUNK_SIZE))
         {
-            printf("Initial logfile mapping failed (%lu).\n", GetLastError());
+            PeonyLogf("Initial logfile mapping failed (%lu).\n", GetLastError());
             CloseHandle(logFile);
             memset(&g_logPumpState, 0, sizeof(g_logPumpState));
             exitCode = 1;
@@ -490,7 +490,7 @@ int main(int argc, char** argv)
     }
     else
     {
-        printf("Control process failed to created shared log object");
+        PeonyLogf("Control process failed to created shared log object");
     }
 #endif
 
@@ -507,7 +507,7 @@ int main(int argc, char** argv)
     DWORD executablePathLength = GetModuleFileNameA(NULL, injectionDllPath, sizeof(injectionDllPath));
     if (executablePathLength == 0 || executablePathLength >= sizeof(injectionDllPath))
     {
-        printf("Failed to get injector executable path: %lu\n", GetLastError());
+        PeonyLogf("Failed to get injector executable path: %lu\n", GetLastError());
         exitCode = 1;
         goto cleanup;
     }
@@ -517,7 +517,7 @@ int main(int argc, char** argv)
     if (!executableName ||
         (size_t)(executableName - injectionDllPath) + sizeof("\\" INJECTION_DLL_NAME) > sizeof(injectionDllPath))
     {
-        printf("Failed to construct injection DLL path\n");
+        PeonyLogf("Failed to construct injection DLL path\n");
         exitCode = 1;
         goto cleanup;
     }
@@ -526,17 +526,17 @@ int main(int argc, char** argv)
     remoteProcInfo = InjectCodeIntoProcess(g_state.pid, injectionDllPath);
     if (!remoteProcInfo.remoteProcHdl)
     {
-        printf("Main injector process: attach failed.\n");
+        PeonyLogf("Main injector process: attach failed.\n");
         exitCode = 1;
         goto cleanup;
     }
-    printf("Injected %s into remote process\n", injectionDllPath);
+    PeonyLogf("Injected %s into remote process\n", injectionDllPath);
 
     if (launchedProcess.hThread)
     {
         if (WaitForSingleObject(remoteProcInfo.remoteThreadHdl, INFINITE) != WAIT_OBJECT_0)
         {
-            printf("Waiting for DBI load failed: %lu\n", GetLastError());
+            PeonyLogf("Waiting for DBI load failed: %lu\n", GetLastError());
             exitCode = 1;
             goto cleanup;
         }
@@ -544,26 +544,26 @@ int main(int argc, char** argv)
         DWORD loadResult = 0;
         if (!GetExitCodeThread(remoteProcInfo.remoteThreadHdl, &loadResult) || loadResult == 0)
         {
-            printf("Loading the DBI DLL failed\n");
+            PeonyLogf("Loading the DBI DLL failed\n");
             exitCode = 1;
             goto cleanup;
         }
 
-        printf("DBI loaded; resuming target process.\n");
+        PeonyLogf("DBI loaded; resuming target process.\n");
         if (ResumeThread(launchedProcess.hThread) == (DWORD)-1)
         {
-            printf("ResumeThread failed: %lu\n", GetLastError());
+            PeonyLogf("ResumeThread failed: %lu\n", GetLastError());
             exitCode = 1;
             goto cleanup;
         }
         launchedProcessResumed = true;
     }
 
-    printf("Main injector process waiting...\n");
+    PeonyLogf("Main injector process waiting...\n");
     DWORD targetWaitResult = WaitForSingleObject(remoteProcInfo.remoteProcHdl, INFINITE);
     if (targetWaitResult != WAIT_OBJECT_0)
     {
-        printf("Waiting for target process failed: %lu\n", GetLastError());
+        PeonyLogf("Waiting for target process failed: %lu\n", GetLastError());
         exitCode = 1;
     }
     else
@@ -571,11 +571,11 @@ int main(int argc, char** argv)
         DWORD targetExitCode = 0;
         if (GetExitCodeProcess(remoteProcInfo.remoteProcHdl, &targetExitCode))
         {
-            printf("Target process exited with code 0x%08lX (%lu)\n", targetExitCode, targetExitCode);
+            PeonyLogf("Target process exited with code 0x%08lX (%lu)\n", targetExitCode, targetExitCode);
         }
         else
         {
-            printf("Failed to get target process exit code: %lu\n", GetLastError());
+            PeonyLogf("Failed to get target process exit code: %lu\n", GetLastError());
             exitCode = 1;
         }
     }
@@ -583,7 +583,7 @@ int main(int argc, char** argv)
 cleanup:
     if (launchedProcess.hThread && !launchedProcessResumed)
     {
-        printf("DBI attach failed; resuming target process without instrumentation.\n");
+        PeonyLogf("DBI attach failed; resuming target process without instrumentation.\n");
         ResumeThread(launchedProcess.hThread);
     }
     if (g_logPumpState.stopEvent)
@@ -641,7 +641,7 @@ cleanup:
     {
         CloseHandle(launchedProcess.hProcess);
     }
-    printf("Main injector process: Peace Out.\n");
+    PeonyLogf("Main injector process: Peace Out.\n");
 
     return exitCode;
 }
