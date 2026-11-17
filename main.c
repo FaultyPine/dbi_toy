@@ -29,6 +29,7 @@ typedef struct
     DWORD targetThreadId;
     char exeName[MAX_PATH];
     char runPath[MAX_PATH];
+    const char* runArgs;
 } GlobalState;
 
 GlobalState g_state;
@@ -228,6 +229,7 @@ DWORD WINAPI InjectedLogPumpThread(LPVOID param)
     X(pid, ParsePid) \
     X(exename, ParseExeName) \
     X(run, ParseRunPath) \
+    X(runArgs, ParseRunArgs) \
     X(targetThreadId, ParseTargetThreadId)
 
 typedef enum
@@ -264,6 +266,11 @@ void ParseExeName(const char* content)
 void ParseRunPath(const char* content)
 {
     strncpy_s(g_state.runPath, sizeof(g_state.runPath), content, MAX_PATH);
+}
+
+void ParseRunArgs(const char* content)
+{
+    g_state.runArgs = content;
 }
 
 void ParseTargetThreadId(const char* content)
@@ -415,11 +422,19 @@ int main(int argc, char** argv)
 
     if (g_state.runPath[0] != '\0')
     {
+        char commandLine[32768];
+        int length = snprintf(commandLine, sizeof(commandLine), "\"%s\" %s",
+            g_state.runPath, g_state.runArgs ? g_state.runArgs : "");
+        if (length < 0 || length >= sizeof(commandLine))
+        {
+            PeonyLogf("Target command line is too long.\n");
+            return 1;
+        }
         STARTUPINFOA startupInfo = {0};
         startupInfo.cb = sizeof(startupInfo);
         if (!CreateProcessA(
                 g_state.runPath,
-                NULL,
+                commandLine,
                 NULL,
                 NULL,
                 FALSE,
@@ -572,6 +587,7 @@ int main(int argc, char** argv)
         if (GetExitCodeProcess(remoteProcInfo.remoteProcHdl, &targetExitCode))
         {
             PeonyLogf("Target process exited with code 0x%08lX (%lu)\n", targetExitCode, targetExitCode);
+            exitCode = targetExitCode == 0 ? 0 : 1;
         }
         else
         {
