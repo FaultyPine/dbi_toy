@@ -181,13 +181,13 @@ static mi_heap_t* g_dbiHeap;
 
 typedef struct
 {
+    uint8_t* reservation_start;
     uint8_t* cursor;
-    signed long long size;
     size_t capacity;
 } CodeCursor;
 
-#define DBI_CODE_CACHE_SIZE (15 * MB)
-#define DBI_LOG_COMPILATION_VERBOSE 1
+#define DBI_CODE_CACHE_SIZE (50 * MB)
+#define DBI_LOG_COMPILATION_VERBOSE 0
 #define CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE (4096*5)
 
 static ThreadHijackState g_hijackedThreadState;
@@ -305,12 +305,43 @@ static bool IsRel32Reachable(uintptr_t fromNextRip, uintptr_t target)
     return delta >= INT32_MIN && delta <= INT32_MAX;
 }
 
+uint8_t* CodeCacheReserve(size_t bytes)
+{
+    if (g_codeCache.used + bytes > g_codeCache.capacity)
+    {
+        PeonyLogf("Code cache is full! capacity = %llu\n", g_codeCache.capacity);
+        return NULL;
+    }
+    uint8_t* result = g_codeCache.base + g_codeCache.used;
+    g_codeCache.used += bytes;
+    return result;
+}
+
+void CodeCacheReclaimUnusedReservation(CodeCursor* cursor)
+{
+    size_t blockSize = cursor->cursor - cursor->reservation_start;
+    assert(blockSize < cursor->capacity);
+    g_codeCache.used -= cursor->capacity - blockSize;
+}
+
+// when we compile a basic block, we reserve some code cache space, fill it out, then shrink the reservation to the actual required size
+// but during the compile, we may fill up the initial reserved space (CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE)
+static void OnCursorSizeChange(CodeCursor* cursor)
+{
+    if (cursor->cursor >= (cursor->reservation_start + cursor->capacity))
+    {
+        if (CodeCacheReserve(CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE))
+        {
+            cursor->capacity += CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE;
+        }
+    }
+}
+
 static bool X64EmitBytes(CodeCursor* cursor, const void* bytes, size_t length)
 {
     memcpy(cursor->cursor, bytes, length);
     cursor->cursor += length;
-    cursor->size -= length;
-    assert(cursor->size > 0);
+    OnCursorSizeChange(cursor);
     return true;
 }
 
@@ -728,8 +759,7 @@ static bool DbiDynasmEncodeSnippet(
     }
 
     cursor->cursor += size;
-    cursor->size -= size;
-    assert(cursor->size > 0);
+    OnCursorSizeChange(cursor);
     return true;
 }
 
@@ -799,8 +829,10 @@ static void CodeCachePatchPendingExits(uintptr_t blockStartPC, uint8_t* targetCo
     hmdel(g_pendingExitPatches, blockStartPC);
 }
 
-static void CodeCachePublishBlock(uintptr_t appPc, uintptr_t appEndPc, uint8_t* blockStart, uint8_t* blockEnd)
+static void CodeCachePublishBlock(uintptr_t appPc, uintptr_t appEndPc, CodeCursor* cursor)
 {
+    uint8_t* blockStart = cursor->reservation_start;
+    uint8_t* blockEnd = cursor->cursor;
     CodeCacheBlock block = {
         .codeCachePc = blockStart,
         .appBytes = appEndPc - appPc,
@@ -809,7 +841,7 @@ static void CodeCachePublishBlock(uintptr_t appPc, uintptr_t appEndPc, uint8_t* 
     hmput(g_codeCache.entries, appPc, block);
     CodeCachePatchPendingExits(appPc, blockStart);
     // now that we know the real size of the code block, rather than the inital guess, reclaim the unused space
-    g_codeCache.used -= CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE - block.codeCacheBytes;
+    CodeCacheReclaimUnusedReservation(cursor);
 }
 
 // tries to initialize code cache memory within rel32 range of 'nearPc'
@@ -880,19 +912,6 @@ bool CodeCacheInit(uintptr_t nearPc)
     PeonyLogf("Code cache allocated at arbitrary address %p. Not necessarily near %p. This will hurt the performance of the instrumented program.", g_codeCache.base, (void*)nearPc);
     return true;
 }
-
-uint8_t* CodeCacheReserve(size_t bytes)
-{
-    if (g_codeCache.used + bytes > g_codeCache.capacity)
-    {
-        PeonyLogf("Code cache is full! capacity = %llu\n", g_codeCache.capacity);
-        return NULL;
-    }
-    uint8_t* result = g_codeCache.base + g_codeCache.used;
-    g_codeCache.used += bytes;
-    return result;
-}
-
 
 void OnCompileBasicBlock(CodeCursor* pOut)
 {
@@ -1064,7 +1083,9 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, dasm_State** MainDst
         }
         else
         {
+#if DBI_LOG_COMPILATION_VERBOSE
             PeonyLogf("Relocated RIP-relative target is not within rel32 range. codeCacheNextRip = %p  absoluteTarget = %p\n", newCodeCacheNextRip, absoluteTarget);
+#endif
             scratchReg = PickUnusedRegister(instr, operands, ripRelocationScratchRegs, ARRAYSIZE(ripRelocationScratchRegs));
             if (scratchReg == ZYDIS_REGISTER_NONE)
             {
@@ -1102,7 +1123,7 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, dasm_State** MainDst
         return false;
     }
     cursor->cursor += encodedLength;
-    cursor->size -= encodedLength;
+    OnCursorSizeChange(cursor);
 
     if (neededLongjump)
     {
@@ -1455,9 +1476,9 @@ bool CompileBlockTerminator(
                 | push DBI_DISPATCH_REG
                 | pushfq
                 // we could call dasm_link to get the actual byte offset this load will be at, but thats heavy-handed. 
-                // instead, i'm just checking if both the begin/end of this block are rel32 reachable
-                // cursor->size also represents the max capacity of the current code cache, so this is very very conservative
-                bool canUseRipRelative = IsRel32Reachable((uintptr_t)cursor->cursor, targetAddress) && IsRel32Reachable((uintptr_t)cursor->cursor + cursor->size, targetAddress);
+                // instead, i'm just checking if both the current/end of this block are rel32 reachable
+                // this is conservative
+                bool canUseRipRelative = IsRel32Reachable((uintptr_t)cursor->cursor, targetAddress) && IsRel32Reachable((uintptr_t)cursor->reservation_start + cursor->capacity, targetAddress);
                 if (canUseRipRelative)
                 {
                     // rip-relative is slightly cheaper
@@ -1611,7 +1632,7 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
 
     uint64_t currentPC = appPc;
     // code emitting "cursor". this points to the code cache we need to write the jitted instructions to
-    CodeCursor codeOut = {.cursor = blockStart, .size = reserveSize, .capacity = reserveSize}; 
+    CodeCursor codeOut = {.reservation_start = blockStart, .cursor = blockStart, .capacity = reserveSize}; 
 
 #if DBI_LOG_COMPILATION_VERBOSE
     PeonyLogf("Compiling basic block at %p -> %p", (void*)appPc, blockStart);
@@ -1655,12 +1676,12 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
 
     FlushInstructionCache(GetCurrentProcess(), blockStart, codeOut.cursor - blockStart);
 
-    CodeCachePublishBlock(appPc, currentPC, blockStart, codeOut.cursor);
+    CodeCachePublishBlock(appPc, currentPC, &codeOut);
     
 #if DBI_LOG_COMPILATION_VERBOSE
     LogCompiledBasicBlockComparison(&decoder, &fmt, appPc, currentPC, blockStart, codeOut.cursor);
-#endif
     PeonyLogf("There are now %llu entries in the code cache. code cache usage = %f%%", (unsigned long long)hmlenu(g_codeCache.entries), ((double)g_codeCache.used / (double)g_codeCache.capacity) * 100.0f);
+#endif
 
     // return the code cache, so now the program will be executing in our instrumented code
     arrfree(patchLabels);

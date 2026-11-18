@@ -10,3 +10,8 @@ currently supports:
 - relocating rip-relative instructions
 - emitting basic block terminators that dispatch back into the DBI
 - backpatching code cache blocks
+
+TODO:
+- continue implementing inline caches for indirect branches
+- split up the code cache to be allocated near the code modules
+

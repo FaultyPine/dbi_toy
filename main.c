@@ -505,7 +505,7 @@ int main(int argc, char** argv)
     }
     else
     {
-        PeonyLogf("Control process failed to created shared log object");
+        PeonyLogf("Control process failed to created shared log object\n");
     }
 #endif
 
