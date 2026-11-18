@@ -90,9 +90,16 @@ static void DbiAllocatorFatalOutOfMemory(size_t size);
 
 typedef struct
 {
+    uint8_t* indirectKey;
+    uint8_t* indirectValue;
+} IndirectPatchSite;
+
+typedef struct
+{
     DWORD64 originalR10;
     CONTEXT savedRegs;
     _Alignas(64) uint8_t xsaveArea[DBI_XSAVE_AREA_SIZE];
+    IndirectPatchSite* cacheToUpdate;
 } ThreadHijackState;
 
 #define SAVEDREGS_OFF_NUM 16
@@ -138,6 +145,8 @@ typedef struct
     CodeCacheBlock value;
 } CodeCacheEntry;
 
+// TODO ExitPatchSite and ExitPatchLabel are basically the same... merge them.
+
 // code cache location that can & will be backpatched
 typedef struct
 {
@@ -177,8 +186,8 @@ typedef struct
     size_t capacity;
 } CodeCursor;
 
-#define DBI_CODE_CACHE_SIZE (100 * MB)
-#define DBI_LOG_COMPILATION_VERBOSE 0
+#define DBI_CODE_CACHE_SIZE (15 * MB)
+#define DBI_LOG_COMPILATION_VERBOSE 1
 #define CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE (4096*5)
 
 static ThreadHijackState g_hijackedThreadState;
@@ -196,6 +205,7 @@ static uint32_t g_xsaveMaskHigh;
 // Stay in signed rel32 +/- 2 GB range when searching for nearby code-cache memory
 static const uintptr_t DBI_CODE_CACHE_NEAR_SEARCH_RADIUS = 0x70000000ULL;
 #define DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC -1
+#define DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC_AND_EMIT_INLINE_CACHE_STORE -2
 
 void Initialize();
 DWORD WINAPI InitializeThread(LPVOID param);
@@ -666,9 +676,41 @@ static bool DbiDynasmEncode(dasm_State** Dst, uint8_t* out, size_t* outSize)
     return true;
 }
 
-static void CodeCacheAddPendingPatch(uintptr_t targetAppPC, uint8_t* patchSite);
+static bool CodeCacheAddPendingPatch(
+    dasm_State** Dst, 
+    ExitPatchLabel* patchLabel, 
+    uint8_t* base)
+{
+    int offset = dasm_getpclabel(Dst, patchLabel->label);
+    if (offset < 0)
+    {
+        PeonyLogf("DynASM patch label %d was not resolved", patchLabel->label);
+        return false;
+    }
+    uint8_t* patchSite = base + offset;
+    uintptr_t targetAppPC = patchLabel->targetAppPC;
 
-static bool DbiDynasmEncodeSnippet(dasm_State** Dst, CodeCursor* cursor, ExitPatchLabel* patchLabels)
+    PendingExitPatchEntry* entry = g_pendingExitPatches
+        ? hmgetp_null(g_pendingExitPatches, targetAppPC)
+        : NULL;
+
+    ExitPatchSite site = {.codeCachePc = patchSite};
+    if (entry)
+    {
+        arrput(entry->value, site);
+        return true;
+    }
+
+    ExitPatchSite* sites = NULL;
+    arrput(sites, site);
+    hmput(g_pendingExitPatches, targetAppPC, sites);
+    return true;
+}
+
+static bool DbiDynasmEncodeSnippet(
+    dasm_State** Dst,
+    CodeCursor* cursor,
+    ExitPatchLabel* patchLabels)
 {
     uint8_t* base = cursor->cursor;
     size_t size = 0;
@@ -679,13 +721,10 @@ static bool DbiDynasmEncodeSnippet(dasm_State** Dst, CodeCursor* cursor, ExitPat
 
     for (int i = 0; i < arrlen(patchLabels); i++)
     {
-        int offset = dasm_getpclabel(Dst, patchLabels[i].label);
-        if (offset < 0)
+        if (!CodeCacheAddPendingPatch(Dst, &patchLabels[i], base))
         {
-            PeonyLogf("DynASM patch label %d was not resolved", patchLabels[i].label);
             return false;
         }
-        CodeCacheAddPendingPatch(patchLabels[i].targetAppPC, base + offset);
     }
 
     cursor->cursor += size;
@@ -694,14 +733,14 @@ static bool DbiDynasmEncodeSnippet(dasm_State** Dst, CodeCursor* cursor, ExitPat
     return true;
 }
 
-static bool DbiPatchExitToDirectJump(uint8_t* patchSite, uint8_t* targetCodeCachePC)
-{
+static bool DbiPatchExitToDirectJump(ExitPatchSite* patchSite, uint8_t* targetCodeCachePC)
+{    
     dasm_State* D = NULL;
     dasm_State** Dst = &D;
     DbiDynasmInit(Dst);
 
     | jmp &targetCodeCachePC
-
+    
     size_t size = 0;
     int status = dasm_link(Dst, &size);
     if (status != 0)
@@ -718,7 +757,7 @@ static bool DbiPatchExitToDirectJump(uint8_t* patchSite, uint8_t* targetCodeCach
         return false;
     }
 
-    status = dasm_encode(Dst, patchSite);
+    status = dasm_encode(Dst, patchSite->codeCachePc);
     dasm_free(Dst);
     if (status != 0)
     {
@@ -726,26 +765,8 @@ static bool DbiPatchExitToDirectJump(uint8_t* patchSite, uint8_t* targetCodeCach
         return false;
     }
 
-    FlushInstructionCache(GetCurrentProcess(), patchSite, size);
+    FlushInstructionCache(GetCurrentProcess(), patchSite->codeCachePc, size);
     return true;
-}
-
-static void CodeCacheAddPendingPatch(uintptr_t targetAppPC, uint8_t* patchSite)
-{
-    PendingExitPatchEntry* entry = g_pendingExitPatches
-        ? hmgetp_null(g_pendingExitPatches, targetAppPC)
-        : NULL;
-
-    ExitPatchSite site = {.codeCachePc = patchSite};
-    if (entry)
-    {
-        arrput(entry->value, site);
-        return;
-    }
-
-    ExitPatchSite* sites = NULL;
-    arrput(sites, site);
-    hmput(g_pendingExitPatches, targetAppPC, sites);
 }
 
 static void CodeCachePatchPendingExits(uintptr_t blockStartPC, uint8_t* targetCodeCachePC)
@@ -754,7 +775,8 @@ static void CodeCachePatchPendingExits(uintptr_t blockStartPC, uint8_t* targetCo
     {
         return;
     }
-
+    // the logic here is a little confusing, because when we publish some code block
+    // we want to patch exits in *other* blocks that *want to jump to this one*. 
     PendingExitPatchEntry* entry = hmgetp_null(g_pendingExitPatches, blockStartPC);
     if (!entry)
     {
@@ -764,9 +786,11 @@ static void CodeCachePatchPendingExits(uintptr_t blockStartPC, uint8_t* targetCo
     ExitPatchSite* sites = entry->value;
     for (int i = 0; i < arrlen(sites); i++)
     {
-        if (!DbiPatchExitToDirectJump(sites[i].codeCachePc, targetCodeCachePC))
+        ExitPatchSite* site = &sites[i];
+        // "patch the other site's exit with a jump to this block's code cache pc"
+        if (!DbiPatchExitToDirectJump(site, targetCodeCachePC))
         {
-            PeonyLogf("Failed to patch exit at %p to %p", sites[i].codeCachePc, targetCodeCachePC);
+            PeonyLogf("Failed to patch exit at %p to %p", site->codeCachePc, targetCodeCachePC);
             continue;
         }
     }
@@ -1093,9 +1117,11 @@ bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, dasm_State** MainDst
     return true;
 }
 
-static void DbiEmitExitTrampoline(dasm_State** Dst, uintptr_t targetAppPC)
+static void DbiEmitExitTrampoline(
+    dasm_State** Dst, 
+    uintptr_t targetAppPC)
 {
-    bool dispatchRegHasTargetPC = targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC;
+    bool dispatchRegHasTargetPC = targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC || targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC_AND_EMIT_INLINE_CACHE_STORE;
 
     | push DBI_STATE_REG
     if (!dispatchRegHasTargetPC)
@@ -1111,6 +1137,13 @@ static void DbiEmitExitTrampoline(dasm_State** Dst, uintptr_t targetAppPC)
 
     | mov qword [DBI_STATE_REG], DBI_DISPATCH_REG
     
+    if (targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC_AND_EMIT_INLINE_CACHE_STORE)
+    {
+        | mov64 DBI_STATE_REG, (uintptr_t)&g_hijackedThreadState.cacheToUpdate
+        | lea DBI_DISPATCH_REG, [<7]
+        | mov qword [DBI_STATE_REG], DBI_DISPATCH_REG
+    }
+
     if (!dispatchRegHasTargetPC)
     {
         | pop DBI_DISPATCH_REG
@@ -1128,33 +1161,43 @@ static void DbiEmitExitTrampoline(dasm_State** Dst, uintptr_t targetAppPC)
     // jmp qword ptr [rip + 0]    <- this is an absolute indirect jump using a 64bit pointer embedded right after this jmp instruction
     | jmp qword [>9]
     |9:
-    |.quad (uintptr_t)DBIExitTrampoline
+    |.qword (uintptr_t)DBIExitTrampoline
 }
 
 // emits a dbi exit trampoline, but also appends to a list of exit labels so we can later backpatch this
-static bool DbiEmitPatchableExit(dasm_State** Dst, uintptr_t targetAppPC, ExitPatchLabel** patchLabels)
+// returns the code cache mapped to the targetAppPC
+static bool DbiEmitPatchableExit(
+    dasm_State** Dst, 
+    ExitPatchLabel patchLabel,
+    ExitPatchLabel** patchLabels)
 {
-    uint8_t* targetCodeCachePC = CodeCacheLookup(targetAppPC);
+    uint8_t* targetCodeCachePC = CodeCacheLookup(patchLabel.targetAppPC);
     if (targetCodeCachePC)
     {
         | jmp &targetCodeCachePC
         return true;
     }
 
-    int label = arrlen(*patchLabels);
-    dasm_growpc(Dst, label + 1);
+    if (patchLabel.label <= 0)
+    {
+        patchLabel.label = arrlen(*patchLabels);
+        dasm_growpc(Dst, patchLabel.label + 1);
+    }
 
-    ExitPatchLabel patchLabel = {.targetAppPC = targetAppPC, .label = label};
     arrput(*patchLabels, patchLabel);
 
-    |=>label:
+    |=>patchLabel.label:
     // the bytes here (emitted in the below function) are what gets backpatched
-    DbiEmitExitTrampoline(Dst, targetAppPC);
+    DbiEmitExitTrampoline(Dst, patchLabel.targetAppPC);
     return true;
 }
 
 static void DbiEmitPush(dasm_State** Dst, uintptr_t returnAppPC)
 {
+    // we push the "return" address on the stack.
+    // we will be returning to this current (really, next) pc
+    // we dont want to clobber regs here, so we use this xchg trick on the stack 
+    // to make sure DBI_DISPATCH_REG is the same as before, and top of the stack has the return address (nextSeqAppPC)
     | push DBI_DISPATCH_REG
     | mov64 DBI_DISPATCH_REG, returnAppPC
     | xchg qword [rsp], DBI_DISPATCH_REG
@@ -1325,14 +1368,7 @@ bool CompileBlockTerminator(
             // direct call EX: "call 0x00007FF6327770A8"
             if (GetDirectRelativeTarget(instr, operands, currentPC, &targetAddress))
             {
-                // we push the "return" address on the stack.
-                // we will be returning to this current (really, next) pc
-                // we dont want to clobber regs here, so we use this xchg trick on the stack 
-                // to make sure DBI_DISPATCH_REG is the same as before, and top of the stack has the return address (nextSeqAppPC)
-                if (!DbiEmitPatchableExit(Dst, targetAddress, patchLabels))
-                {
-                    return false;
-                }
+                DbiEmitPatchableExit(Dst, (ExitPatchLabel){.targetAppPC = targetAddress}, patchLabels);
                 return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
             // memory indirect call EX: "call qword ptr [rip + 0x1234]"
@@ -1388,10 +1424,7 @@ bool CompileBlockTerminator(
             // immediate jmp EX: jmp 0xDEADBEEF
             if (GetDirectRelativeTarget(instr, operands, currentPC, &targetAddress))
             {
-                if (!DbiEmitPatchableExit(Dst, targetAddress, patchLabels))
-                {
-                    return false;
-                }
+                DbiEmitPatchableExit(Dst, (ExitPatchLabel){.targetAppPC = targetAddress}, patchLabels);
                 return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
             // memory indirect jmp EX: "jmp qword ptr [rip + 0x1234]"
@@ -1420,14 +1453,29 @@ bool CompileBlockTerminator(
                 #endif
                 // the emitexit call will always pop dispatch_reg back
                 | push DBI_DISPATCH_REG
+                | pushfq
                 | mov64 DBI_DISPATCH_REG, targetAddress
                 | mov DBI_DISPATCH_REG, qword [DBI_DISPATCH_REG]
-                // TODO: backpatchable indirect jumps... but getting indirect jumps to be backpatchable is complicated.
-                // i'm hearing that the way to do it is to emit little "inline" caches of the previous jump.
-                // before the jump, we compare the current target address of the jump to the previous time we took this jump
-                // if they're the same, we read the "inline" cache (which is just a spare 8 bytes emitted in the instruction block itself) 
-                // to get the code cache location to jump to.
-                DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
+
+                // inline cache of the indirect target addr
+                // since the target address coming in is one that points to the actual app code,
+                // we need to translate it to the equiv addr in da code cache
+                // we could do that through our trampoline, but that's slow, so we put what is 
+                // basically a single-entry key-value map in the code itself. So if the app address doesn't change, we hit the same code cache addr every time.
+                | cmp DBI_DISPATCH_REG, qword [>7]
+                // x64 has no conditional jump through a memory operand, so we need this extra one
+                | jne >9
+                | popfq
+                | pop DBI_DISPATCH_REG // ? needed?
+                | jmp qword [>8]
+                |7:
+                |.qword 0
+                |8: // value
+                |.qword 0
+                |9:
+                | popfq
+                
+                DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC_AND_EMIT_INLINE_CACHE_STORE);
                 return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
             }
             // register indirect jmp EX: "jmp rax"
@@ -1471,15 +1519,9 @@ bool CompileBlockTerminator(
                 PeonyLogf("Unsupported conditional branch Jcc code at %p", currentPC);
                 return false;
             }
-            if (!DbiEmitPatchableExit(Dst, nextSeqAppPC, patchLabels))
-            {
-                return false;
-            }
+            DbiEmitPatchableExit(Dst, (ExitPatchLabel){.targetAppPC = nextSeqAppPC}, patchLabels);
             |1:
-            if (!DbiEmitPatchableExit(Dst, targetAddress, patchLabels))
-            {
-                return false;
-            }
+            DbiEmitPatchableExit(Dst, (ExitPatchLabel){.targetAppPC = targetAddress}, patchLabels);
             return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
         } break;
         case ZYDIS_CATEGORY_RET:
@@ -1497,10 +1539,7 @@ bool CompileBlockTerminator(
                 PeonyLogf("Something went wrong emitting instructions for syscall/sysret");
                 return false;
             }
-            if (!DbiEmitPatchableExit(Dst, nextSeqAppPC, patchLabels))
-            {
-                return false;
-            }
+            DbiEmitPatchableExit(Dst, (ExitPatchLabel){.targetAppPC = nextSeqAppPC}, patchLabels);
             return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
         } break;
         default:
@@ -1642,6 +1681,12 @@ void OnDBIExit(ThreadHijackState* state)
     #endif
     uint8_t* codeCacheRip = DbiLookupOrCompile(appTargetRip);
     state->savedRegs.Rip = (DWORD64)codeCacheRip;
+    if (state->cacheToUpdate)
+    {
+        state->cacheToUpdate->indirectKey = (uint8_t*)appTargetRip;
+        state->cacheToUpdate->indirectValue = codeCacheRip;
+        state->cacheToUpdate = NULL;
+    }
 }
 
 
