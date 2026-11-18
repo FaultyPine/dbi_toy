@@ -1454,8 +1454,20 @@ bool CompileBlockTerminator(
                 // the emitexit call will always pop dispatch_reg back
                 | push DBI_DISPATCH_REG
                 | pushfq
-                | mov64 DBI_DISPATCH_REG, targetAddress
-                | mov DBI_DISPATCH_REG, qword [DBI_DISPATCH_REG]
+                // we could call dasm_link to get the actual byte offset this load will be at, but thats heavy-handed. 
+                // instead, i'm just checking if both the begin/end of this block are rel32 reachable
+                // cursor->size also represents the max capacity of the current code cache, so this is very very conservative
+                bool canUseRipRelative = IsRel32Reachable((uintptr_t)cursor->cursor, targetAddress) && IsRel32Reachable((uintptr_t)cursor->cursor + cursor->size, targetAddress);
+                if (canUseRipRelative)
+                {
+                    // rip-relative is slightly cheaper
+                    | mov DBI_DISPATCH_REG, qword [&targetAddress]
+                }
+                else
+                {
+                    | mov64 DBI_DISPATCH_REG, targetAddress
+                    | mov DBI_DISPATCH_REG, qword [DBI_DISPATCH_REG]
+                }
 
                 // inline cache of the indirect target addr
                 // since the target address coming in is one that points to the actual app code,
