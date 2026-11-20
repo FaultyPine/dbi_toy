@@ -9,7 +9,7 @@ currently supports:
 - injecting into a target process/thread, or waiting for an exe with a given name to spawn
 - relocating rip-relative instructions
 - emitting basic block terminators that dispatch back into the DBI
-- backpatching code cache blocks
+- backpatching code cache blocks (direct and indirect branches)
 
 TODO:
 - split up the code cache to be allocated near the code modules

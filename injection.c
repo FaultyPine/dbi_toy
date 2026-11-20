@@ -1563,8 +1563,7 @@ bool CompileBlockTerminator(
         {
             // save the original dispatch reg on the stack, the emitexit function will always pop this back into dispatch_reg
             | xchg qword [rsp], DBI_DISPATCH_REG
-            DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
-            return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+            return EmitIndirectBranchWithInlineCache(Dst, cursor, patchLabels);
         } break;
         case ZYDIS_CATEGORY_INTERRUPT:
         case ZYDIS_CATEGORY_SYSCALL:
