@@ -12,6 +12,5 @@ currently supports:
 - backpatching code cache blocks
 
 TODO:
-- continue implementing inline caches for indirect branches
 - split up the code cache to be allocated near the code modules
 
