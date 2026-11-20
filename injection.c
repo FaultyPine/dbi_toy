@@ -1433,8 +1433,7 @@ bool CompileBlockTerminator(
                         PeonyLogf("Unsupported memory-register call at %p", (void*)currentPC);
                         return false;
                     }
-                    DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
-                    return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+                    return EmitIndirectBranchWithInlineCache(Dst, cursor, patchLabels);
                 }
                 if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &targetAddress)))
                 {
@@ -1447,8 +1446,7 @@ bool CompileBlockTerminator(
                 | mov64 DBI_DISPATCH_REG, targetAddress
                 | mov DBI_DISPATCH_REG, qword [DBI_DISPATCH_REG]
                 
-                DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
-                return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+                return EmitIndirectBranchWithInlineCache(Dst, cursor, patchLabels);
             }
             // register indirect call EX: "call rax"
             else if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
@@ -1463,8 +1461,7 @@ bool CompileBlockTerminator(
 
                 | push DBI_DISPATCH_REG
                 | mov DBI_DISPATCH_REG, Rq(jumpRegIndex)
-                DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
-                return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+                return EmitIndirectBranchWithInlineCache(Dst, cursor, patchLabels);
             }
             return false;
         } break;
