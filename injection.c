@@ -1161,7 +1161,7 @@ static void DbiEmitExitTrampoline(
     if (targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC_AND_EMIT_INLINE_CACHE_STORE)
     {
         | mov64 DBI_STATE_REG, (uintptr_t)&g_hijackedThreadState.cacheToUpdate
-        | lea DBI_DISPATCH_REG, [<7]
+        | lea DBI_DISPATCH_REG, [<7] // see EmitIndirectBranchWithInlineCache
         | mov qword [DBI_STATE_REG], DBI_DISPATCH_REG
     }
 
