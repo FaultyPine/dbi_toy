@@ -1236,7 +1236,7 @@ static bool DbiEmitRegisterAddressedIndirectTarget(
     bool hasBase = baseReg != ZYDIS_REGISTER_NONE;
     bool hasIndex = indexReg != ZYDIS_REGISTER_NONE;
     int baseIndex = 0;
-    int indexIndex = 0;
+    int indexIndex = 0; // :)
 
     if (!hasBase && !hasIndex)
     {
@@ -1366,6 +1366,34 @@ static bool DbiEmitJccToLabel1(dasm_State** Dst, ZydisMnemonic mnemonic)
     }
 }
 
+bool EmitIndirectBranchWithInlineCache(
+    dasm_State** Dst,
+    CodeCursor* cursor,
+    ExitPatchLabel** patchLabels)
+{
+    | pushfq
+    // inline cache of the indirect target addr
+    // since the target address coming in is one that points to the actual app code,
+    // we need to translate it to the equiv addr in da code cache
+    // we could do that through our trampoline, but that's slow, so we put what is 
+    // basically a single-entry key-value map in the code itself. So if the app address doesn't change, we hit the same code cache addr every time.
+    | cmp DBI_DISPATCH_REG, qword [>7]
+    // x64 has no conditional jump through a memory operand, so we need this extra one
+    | jne >9
+    | popfq
+    | pop DBI_DISPATCH_REG // ? needed?
+    | jmp qword [>8]
+    |7:
+    |.qword 0
+    |8: // value
+    |.qword 0
+    |9:
+    | popfq
+    
+    DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC_AND_EMIT_INLINE_CACHE_STORE);
+    return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+}
+
 bool CompileBlockTerminator(
     CodeCursor* cursor, 
     uintptr_t currentPC, 
@@ -1461,8 +1489,7 @@ bool CompileBlockTerminator(
                         PeonyLogf("Unsupported memory-register uncond br at %p", (void*)currentPC);
                         return false;
                     }
-                    DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
-                    return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+                    return EmitIndirectBranchWithInlineCache(Dst, cursor, patchLabels);
                 }
                 if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &targetAddress)))
                 {
@@ -1474,7 +1501,6 @@ bool CompileBlockTerminator(
                 #endif
                 // the emitexit call will always pop dispatch_reg back
                 | push DBI_DISPATCH_REG
-                | pushfq
                 // we could call dasm_link to get the actual byte offset this load will be at, but thats heavy-handed. 
                 // instead, i'm just checking if both the current/end of this block are rel32 reachable
                 // this is conservative
@@ -1489,27 +1515,7 @@ bool CompileBlockTerminator(
                     | mov64 DBI_DISPATCH_REG, targetAddress
                     | mov DBI_DISPATCH_REG, qword [DBI_DISPATCH_REG]
                 }
-
-                // inline cache of the indirect target addr
-                // since the target address coming in is one that points to the actual app code,
-                // we need to translate it to the equiv addr in da code cache
-                // we could do that through our trampoline, but that's slow, so we put what is 
-                // basically a single-entry key-value map in the code itself. So if the app address doesn't change, we hit the same code cache addr every time.
-                | cmp DBI_DISPATCH_REG, qword [>7]
-                // x64 has no conditional jump through a memory operand, so we need this extra one
-                | jne >9
-                | popfq
-                | pop DBI_DISPATCH_REG // ? needed?
-                | jmp qword [>8]
-                |7:
-                |.qword 0
-                |8: // value
-                |.qword 0
-                |9:
-                | popfq
-                
-                DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC_AND_EMIT_INLINE_CACHE_STORE);
-                return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+                return EmitIndirectBranchWithInlineCache(Dst, cursor, patchLabels);
             }
             // register indirect jmp EX: "jmp rax"
             else if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
@@ -1524,8 +1530,7 @@ bool CompileBlockTerminator(
 
                 | push DBI_DISPATCH_REG
                 | mov DBI_DISPATCH_REG, Rq(jumpRegIndex)
-                DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC);
-                return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+                return EmitIndirectBranchWithInlineCache(Dst, cursor, patchLabels);
             }
             else
             {
