@@ -146,20 +146,23 @@ typedef struct
     CodeCacheBlock value;
 } CodeCacheEntry;
 
-// TODO ExitPatchSite and ExitPatchLabel are basically the same... merge them.
-
 // code cache location that can & will be backpatched
 typedef struct
 {
     uint8_t* codeCachePc;
 } ExitPatchSite;
 
-// labels placed at the exits of code cache blocks for later backpatching
+// Labels for exits and RIP-relative operands that need their final code address.
 typedef struct
 {
     uintptr_t targetAppPC;
     int label;
-} ExitPatchLabel;
+    // for rip-relative relocation, which gets backpatched
+    bool ripRelative;
+    bool eipRelative;
+    uint8_t instructionLength;
+    uint8_t displacementOffset;
+} CodePatchLabel;
 
 typedef struct
 {
@@ -322,29 +325,16 @@ uint8_t* CodeCacheReserve(size_t bytes)
 void CodeCacheReclaimUnusedReservation(CodeCursor* cursor)
 {
     size_t blockSize = cursor->cursor - cursor->reservation_start;
-    assert(blockSize < cursor->capacity);
+    assert(blockSize <= cursor->capacity);
     g_codeCache.used -= cursor->capacity - blockSize;
 }
 
-// when we compile a basic block, we reserve some code cache space, fill it out, then shrink the reservation to the actual required size
-// but during the compile, we may fill up the initial reserved space (CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE)
-static void OnCursorSizeChange(CodeCursor* cursor)
+static void DbiEmitBytes(dasm_State** Dst, const uint8_t* bytes, size_t length)
 {
-    if (cursor->cursor >= (cursor->reservation_start + cursor->capacity))
+    for (size_t i = 0; i < length; i++)
     {
-        if (CodeCacheReserve(CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE))
-        {
-            cursor->capacity += CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE;
-        }
+        | .byte bytes[i]
     }
-}
-
-static bool X64EmitBytes(CodeCursor* cursor, const void* bytes, size_t length)
-{
-    memcpy(cursor->cursor, bytes, length);
-    cursor->cursor += length;
-    OnCursorSizeChange(cursor);
-    return true;
 }
 
 static void LogDecodedInstructionRange(
@@ -688,30 +678,9 @@ static void DbiDynasmInit(dasm_State** Dst)
     dasm_setup(Dst, peony_dynasm_actions);
 }
 
-static bool DbiDynasmEncode(dasm_State** Dst, uint8_t* out, size_t* outSize)
-{
-    size_t size = 0;
-    int status = dasm_link(Dst, &size);
-    if (status != 0)
-    {
-        PeonyLogf("DynASM link failed with status %d", status);
-        return false;
-    }
-
-    status = dasm_encode(Dst, out);
-    if (status != 0)
-    {
-        PeonyLogf("DynASM encode failed with status %d", status);
-        return false;
-    }
-
-    *outSize = size;
-    return true;
-}
-
 static bool CodeCacheAddPendingPatch(
     dasm_State** Dst, 
-    ExitPatchLabel* patchLabel, 
+    CodePatchLabel* patchLabel,
     uint8_t* base)
 {
     int offset = dasm_getpclabel(Dst, patchLabel->label);
@@ -740,28 +709,73 @@ static bool CodeCacheAddPendingPatch(
     return true;
 }
 
-static bool DbiDynasmEncodeSnippet(
-    dasm_State** Dst,
-    CodeCursor* cursor,
-    ExitPatchLabel* patchLabels)
+static bool DbiDynasmEncode(dasm_State** Dst, CodeCursor* cursor, CodePatchLabel* patchLabels)
 {
-    uint8_t* base = cursor->cursor;
     size_t size = 0;
-    if (!DbiDynasmEncode(Dst, base, &size))
+    int status = dasm_link(Dst, &size);
+    if (status != 0)
     {
+        PeonyLogf("DynASM link failed with status %d", status);
         return false;
     }
 
-    for (int i = 0; i < arrlen(patchLabels); i++)
+    size_t required = (size_t)(cursor->cursor - cursor->reservation_start) + size;
+    if (required > cursor->capacity)
     {
-        if (!CodeCacheAddPendingPatch(Dst, &patchLabels[i], base))
+        uint8_t* extra = CodeCacheReserve(required - cursor->capacity);
+        if (!extra)
         {
             return false;
         }
+        cursor->capacity = required;
     }
 
+    uint8_t* base = cursor->cursor;
+    status = dasm_encode(Dst, base);
+    if (status != 0)
+    {
+        PeonyLogf("DynASM encode failed with status %d", status);
+        return false;
+    }
+
+    // Layout is final now, so raw instructions can receive their new displacement.
+    for (int i = 0; i < arrlen(patchLabels); i++)
+    {
+        CodePatchLabel* patch = &patchLabels[i];
+        // when we encountered a rip relative instr, we recorded info about it here
+        // we use that info to backpatch it with the correct displacement, since we only know the correct displacement
+        // after we've compiled the full block and know exactly where it's going.
+        if (patch->ripRelative)
+        {
+            int offset = dasm_getpclabel(Dst, patch->label);
+            if (offset < 0)
+            {
+                PeonyLogf("DynASM relocation label %d was not resolved", patch->label);
+                return false;
+            }
+            uintptr_t nextRip = (uintptr_t)(base + offset + patch->instructionLength);
+            bool reachable = patch->eipRelative || IsRel32Reachable(nextRip, patch->targetAppPC);
+            if (!reachable)
+            {
+                PeonyLogf("RIP-relative target %p is out of reach from %p", (void*)patch->targetAppPC, (void*)nextRip);
+                return false;
+            }
+            uint32_t displacement = (uint32_t)patch->targetAppPC - (uint32_t)nextRip;
+            memcpy(base + offset + patch->displacementOffset, &displacement, sizeof(displacement));
+        }
+    }
+    for (int i = 0; i < arrlen(patchLabels); i++)
+    {
+        if (!patchLabels[i].ripRelative)
+        {
+            bool added = CodeCacheAddPendingPatch(Dst, &patchLabels[i], base);
+            if (!added)
+            {
+                return false;
+            }
+        }
+    }
     cursor->cursor += size;
-    OnCursorSizeChange(cursor);
     return true;
 }
 
@@ -999,144 +1013,89 @@ static ZydisRegister PickUnusedRegister(
     return ZYDIS_REGISTER_NONE;
 }
 
-bool GetRipRelativeMemoryOp(ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands, uintptr_t instructionAddress, uintptr_t* outTarget)
+bool EmitAndPossiblyRelocateInstruction(
+    CodeCursor* cursor,
+    dasm_State** Dst,
+    uintptr_t appPc,
+    ZydisDecodedInstruction* instr,
+    ZydisDecodedOperand* operands,
+    CodePatchLabel** patchLabels)
 {
     for (int i = 0; i < instr->operand_count_visible; i++)
     {
         ZydisDecodedOperand* operand = &operands[i];
-        if (IsRipRelativeMemoryOp(operand))
-        {
-            ZyanU64 target = 0;
-            if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(instr, operands, instructionAddress, &target)))
-            {
-                if (outTarget)
-                {
-                    *outTarget = target;
-                }
-            }
-            return true;
-        }
-    }
-    return false;
-}
-
-bool EmitAndPossiblyRelocateInstruction(CodeCursor* cursor, dasm_State** MainDst, uintptr_t appPc, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands)
-{
-    // if it's not a rip-relative instruction, we can just emit the original one exactly as it was
-    bool isRipRelativeMemoryOperand = GetRipRelativeMemoryOp(instr, operands, 0, 0);
-    if (!isRipRelativeMemoryOperand)
-    {
-        return X64EmitBytes(cursor, (void*)appPc, instr->length);
-    }
-
-    // preparing to emit relocated instruction
-    ZydisEncoderRequest req;
-    if (ZYAN_FAILED(ZydisEncoderDecodedInstructionToEncoderRequest(
-            instr,
-            operands,
-            instr->operand_count_visible,
-            &req)))
-    {
-        PeonyLogf("Failed to create encoder request for RIP-relative instruction at %p", (void*)appPc);
-        return false;
-    }
-
-    // rip relative relocation
-    // example original instruction
-    // mov rax, qword ptr [rip + disp32]
-    // disp32 is relative to the next instruction addr, so the real memory addr we're moving into rax is
-    // absoluteTarget = original_next_rip + original_disp32;
-    // so the new displacement is
-    // new_disp32 = absoluteTarget - cache_next_rip;
-
-    bool neededLongjump = false;
-    ZydisRegister scratchReg = ZYDIS_REGISTER_NONE;
-    int scratchRegIndex = 0;
-    const ZydisRegister ripRelocationScratchRegs[] = {DBI_ZYDIS_DISPATCH_REG, DBI_ZYDIS_STATE_REG};
-    uint8_t* codeCachePc = cursor->cursor;
-
-    for (int i = 0; i < instr->operand_count_visible; i++)
-    {
-        ZydisDecodedOperand* operand = &operands[i];
-        if (!IsRipRelativeMemoryOp(operand))
+        bool relativeOperand = IsRipRelativeMemoryOp(operand);
+        if (!relativeOperand)
         {
             continue;
         }
-        // code cache rip to relocate to
-        // x64 rip-relative memory operands always are relative to the *next* address, hence the `+ instr->length`
-        uintptr_t newCodeCacheNextRip = (uintptr_t)codeCachePc + instr->length;
-
-        #if DBI_LOG_COMPILATION_VERBOSE
-        PeonyLogf("Relocating rip-relative mem op %p -> %p", appPc, newCodeCacheNextRip);
-        #endif
-
-        ZyanU64 absoluteTarget = 0;
-        if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, operand, appPc, &absoluteTarget)))
+        ZyanU64 target = 0;
+        ZyanStatus status = ZydisCalcAbsoluteAddress(instr, operand, appPc, &target);
+        if (ZYAN_FAILED(status))
         {
             PeonyLogf("Failed to resolve RIP-relative target at %p", (void*)appPc);
             return false;
         }
 
-        // from the code cache rip, can i still address the original memory target via rel32?
-        if (IsRel32Reachable(newCodeCacheNextRip, (uintptr_t)absoluteTarget))
+        // The final instruction can land anywhere in the remaining cache.
+        uintptr_t cacheStart = (uintptr_t)cursor->reservation_start;
+        uintptr_t cacheEnd = (uintptr_t)g_codeCache.base + g_codeCache.capacity;
+        bool eipRelative = operand->mem.base == ZYDIS_REGISTER_EIP;
+        bool reachable = eipRelative || (IsRel32Reachable(cacheStart, target) && IsRel32Reachable(cacheEnd, target));
+        if (reachable)
         {
-            // rel32 is enough to address the original memory, so we can just do the simple math and reassign the rip-relative part of the operand
-            req.operands[i].mem.displacement = (int64_t)((uintptr_t)absoluteTarget - newCodeCacheNextRip);
+            CodePatchLabel patch = {
+                .targetAppPC = (uintptr_t)target,
+                .label = arrlen(*patchLabels),
+                .ripRelative = true,
+                .eipRelative = eipRelative,
+                .instructionLength = instr->length,
+                .displacementOffset = instr->raw.disp.offset,
+            };
+            dasm_growpc(Dst, patch.label + 1);
+            |=>patch.label:
+            DbiEmitBytes(Dst, (const uint8_t*)appPc, instr->length);
+            arrput(*patchLabels, patch);
+            return true;
         }
-        else
+
+        // Far operands use a saved scratch register holding the absolute address.
+
+        const ZydisRegister candidates[] = {DBI_ZYDIS_DISPATCH_REG, DBI_ZYDIS_STATE_REG};
+        ZydisRegister scratchReg = PickUnusedRegister(instr, operands, candidates, ARRAYSIZE(candidates));
+        int scratchIndex = 0;
+        bool haveScratch = ZydisRegisterToDbiGprIndex(scratchReg, &scratchIndex);
+        if (!haveScratch)
         {
-#if DBI_LOG_COMPILATION_VERBOSE
-            PeonyLogf("Relocated RIP-relative target is not within rel32 range. codeCacheNextRip = %p  absoluteTarget = %p\n", newCodeCacheNextRip, absoluteTarget);
-#endif
-            scratchReg = PickUnusedRegister(instr, operands, ripRelocationScratchRegs, ARRAYSIZE(ripRelocationScratchRegs));
-            if (scratchReg == ZYDIS_REGISTER_NONE)
-            {
-                PeonyLogf("Could not find a scratch register for RIP-relative relocation at %p", (void*)appPc);
-                return false;
-            }
-            if (!ZydisRegisterToDbiGprIndex(scratchReg, &scratchRegIndex))
-            {
-                PeonyLogf("Scratch register for RIP-relative relocation was not a GPR at %p", (void*)appPc);
-                return false;
-            }
-
-            // need a far jump if it's not rel32 reachable, so we use a scratch reg
-            dasm_State* D = NULL;
-            dasm_State** Dst = &D;
-            DbiDynasmInit(Dst);
-            | push Rq(scratchRegIndex)
-            | mov64 Rq(scratchRegIndex), (uintptr_t)absoluteTarget
-            
-            DbiDynasmEncodeSnippet(Dst, cursor, NULL);
-            dasm_free(Dst);
-            req.operands[i].mem.base = scratchReg;
-            req.operands[i].mem.displacement = 0;
-            neededLongjump = true;
-            break;
+            PeonyLogf("Could not find a scratch register for RIP-relative relocation at %p", (void*)appPc);
+            return false;
         }
-    }
 
-    // emit relocated instruction
-    ZyanUSize encodedLength = ZYDIS_MAX_INSTRUCTION_LENGTH;
-    ZyanStatus status = ZydisEncoderEncodeInstruction(&req, cursor->cursor, &encodedLength);
-    if (ZYAN_FAILED(status))
-    {
-        PeonyLogf("Failed to encode relocated instruction at %p status module = %i status = %i", (void*)appPc, ZYAN_STATUS_MODULE(status), ZYAN_STATUS_CODE(status));
-        return false;
-    }
-    cursor->cursor += encodedLength;
-    OnCursorSizeChange(cursor);
+        ZydisEncoderRequest request;
+        status = ZydisEncoderDecodedInstructionToEncoderRequest(instr, operands, instr->operand_count_visible, &request);
+        if (ZYAN_FAILED(status))
+        {
+            PeonyLogf("Failed to create encoder request at %p", (void*)appPc);
+            return false;
+        }
+        request.operands[i].mem.base = scratchReg;
+        request.operands[i].mem.displacement = 0;
+        uint8_t bytes[ZYDIS_MAX_INSTRUCTION_LENGTH];
+        ZyanUSize length = sizeof(bytes);
+        status = ZydisEncoderEncodeInstruction(&request, bytes, &length);
+        if (ZYAN_FAILED(status))
+        {
+            PeonyLogf("Failed to encode relocated instruction at %p: %lu", (void*)appPc, status);
+            return false;
+        }
 
-    if (neededLongjump)
-    {
-        dasm_State* D = NULL;
-        dasm_State** Dst = &D;
-        DbiDynasmInit(Dst);
-        | pop Rq(scratchRegIndex)
-        DbiDynasmEncodeSnippet(Dst, cursor, NULL);
-        dasm_free(Dst);
+        | push Rq(scratchIndex)
+        | mov64 Rq(scratchIndex), target
+        DbiEmitBytes(Dst, bytes, length);
+        | pop Rq(scratchIndex)
+        return true;
     }
-
+    DbiEmitBytes(Dst, (const uint8_t*)appPc, instr->length);
     return true;
 }
 
@@ -1191,8 +1150,8 @@ static void DbiEmitExitTrampoline(
 // returns the code cache mapped to the targetAppPC
 static bool DbiEmitPatchableExit(
     dasm_State** Dst, 
-    ExitPatchLabel patchLabel,
-    ExitPatchLabel** patchLabels)
+    CodePatchLabel patchLabel,
+    CodePatchLabel** patchLabels)
 {
     uint8_t* targetCodeCachePC = CodeCacheLookup(patchLabel.targetAppPC);
     if (targetCodeCachePC)
@@ -1370,8 +1329,7 @@ static bool DbiEmitJccToLabel1(dasm_State** Dst, ZydisMnemonic mnemonic)
 
 bool EmitIndirectBranchWithInlineCache(
     dasm_State** Dst,
-    CodeCursor* cursor,
-    ExitPatchLabel** patchLabels)
+    CodePatchLabel** patchLabels)
 {
     | pushfq
     // inline cache of the indirect target addr
@@ -1393,7 +1351,7 @@ bool EmitIndirectBranchWithInlineCache(
     | popfq
     
     DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC_AND_EMIT_INLINE_CACHE_STORE);
-    return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+    return true;
 }
 
 bool CompileBlockTerminator(
@@ -1402,7 +1360,7 @@ bool CompileBlockTerminator(
     ZydisDecodedInstruction* instr, 
     ZydisDecodedOperand* operands,
     dasm_State** Dst,
-    ExitPatchLabel** patchLabels)
+    CodePatchLabel** patchLabels)
 {
     // the PC after this terminator instruction
     // also used as the "fallthrough" PC when we decide a branch shouldn't be taken
@@ -1419,8 +1377,8 @@ bool CompileBlockTerminator(
             // direct call EX: "call 0x00007FF6327770A8"
             if (GetDirectRelativeTarget(instr, operands, currentPC, &targetAddress))
             {
-                DbiEmitPatchableExit(Dst, (ExitPatchLabel){.targetAppPC = targetAddress}, patchLabels);
-                return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+                DbiEmitPatchableExit(Dst, (CodePatchLabel){.targetAppPC = targetAddress}, patchLabels);
+                return true;
             }
             // memory indirect call EX: "call qword ptr [rip + 0x1234]"
             else if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
@@ -1435,7 +1393,7 @@ bool CompileBlockTerminator(
                         PeonyLogf("Unsupported memory-register call at %p", (void*)currentPC);
                         return false;
                     }
-                    return EmitIndirectBranchWithInlineCache(Dst, cursor, patchLabels);
+                    return EmitIndirectBranchWithInlineCache(Dst, patchLabels);
                 }
                 if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &targetAddress)))
                 {
@@ -1448,7 +1406,7 @@ bool CompileBlockTerminator(
                 | mov64 DBI_DISPATCH_REG, targetAddress
                 | mov DBI_DISPATCH_REG, qword [DBI_DISPATCH_REG]
                 
-                return EmitIndirectBranchWithInlineCache(Dst, cursor, patchLabels);
+                return EmitIndirectBranchWithInlineCache(Dst, patchLabels);
             }
             // register indirect call EX: "call rax"
             else if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
@@ -1463,7 +1421,7 @@ bool CompileBlockTerminator(
 
                 | push DBI_DISPATCH_REG
                 | mov DBI_DISPATCH_REG, Rq(jumpRegIndex)
-                return EmitIndirectBranchWithInlineCache(Dst, cursor, patchLabels);
+                return EmitIndirectBranchWithInlineCache(Dst, patchLabels);
             }
             return false;
         } break;
@@ -1472,8 +1430,8 @@ bool CompileBlockTerminator(
             // immediate jmp EX: jmp 0xDEADBEEF
             if (GetDirectRelativeTarget(instr, operands, currentPC, &targetAddress))
             {
-                DbiEmitPatchableExit(Dst, (ExitPatchLabel){.targetAppPC = targetAddress}, patchLabels);
-                return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+                DbiEmitPatchableExit(Dst, (CodePatchLabel){.targetAppPC = targetAddress}, patchLabels);
+                return true;
             }
             // memory indirect jmp EX: "jmp qword ptr [rip + 0x1234]"
             else if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
@@ -1488,7 +1446,7 @@ bool CompileBlockTerminator(
                         PeonyLogf("Unsupported memory-register uncond br at %p", (void*)currentPC);
                         return false;
                     }
-                    return EmitIndirectBranchWithInlineCache(Dst, cursor, patchLabels);
+                    return EmitIndirectBranchWithInlineCache(Dst, patchLabels);
                 }
                 if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(instr, &operands[0], currentPC, &targetAddress)))
                 {
@@ -1500,10 +1458,9 @@ bool CompileBlockTerminator(
                 #endif
                 // the emitexit call will always pop dispatch_reg back
                 | push DBI_DISPATCH_REG
-                // we could call dasm_link to get the actual byte offset this load will be at, but thats heavy-handed. 
-                // instead, i'm just checking if both the current/end of this block are rel32 reachable
-                // this is conservative
-                bool canUseRipRelative = IsRel32Reachable((uintptr_t)cursor->cursor, targetAddress) && IsRel32Reachable((uintptr_t)cursor->reservation_start + cursor->capacity, targetAddress);
+                // Use RIP-relative addressing only if the target is reachable from the entire cache.
+                bool canUseRipRelative = IsRel32Reachable((uintptr_t)cursor->reservation_start, targetAddress) &&
+                    IsRel32Reachable((uintptr_t)g_codeCache.base + g_codeCache.capacity, targetAddress);
                 if (canUseRipRelative)
                 {
                     // rip-relative is slightly cheaper
@@ -1514,7 +1471,7 @@ bool CompileBlockTerminator(
                     | mov64 DBI_DISPATCH_REG, targetAddress
                     | mov DBI_DISPATCH_REG, qword [DBI_DISPATCH_REG]
                 }
-                return EmitIndirectBranchWithInlineCache(Dst, cursor, patchLabels);
+                return EmitIndirectBranchWithInlineCache(Dst, patchLabels);
             }
             // register indirect jmp EX: "jmp rax"
             else if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
@@ -1529,7 +1486,7 @@ bool CompileBlockTerminator(
 
                 | push DBI_DISPATCH_REG
                 | mov DBI_DISPATCH_REG, Rq(jumpRegIndex)
-                return EmitIndirectBranchWithInlineCache(Dst, cursor, patchLabels);
+                return EmitIndirectBranchWithInlineCache(Dst, patchLabels);
             }
             else
             {
@@ -1556,27 +1513,28 @@ bool CompileBlockTerminator(
                 PeonyLogf("Unsupported conditional branch Jcc code at %p", currentPC);
                 return false;
             }
-            DbiEmitPatchableExit(Dst, (ExitPatchLabel){.targetAppPC = nextSeqAppPC}, patchLabels);
+            DbiEmitPatchableExit(Dst, (CodePatchLabel){.targetAppPC = nextSeqAppPC}, patchLabels);
             |1:
-            DbiEmitPatchableExit(Dst, (ExitPatchLabel){.targetAppPC = targetAddress}, patchLabels);
-            return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+            DbiEmitPatchableExit(Dst, (CodePatchLabel){.targetAppPC = targetAddress}, patchLabels);
+            return true;
         } break;
         case ZYDIS_CATEGORY_RET:
         {
             // save the original dispatch reg on the stack, the emitexit function will always pop this back into dispatch_reg
             | xchg qword [rsp], DBI_DISPATCH_REG
-            return EmitIndirectBranchWithInlineCache(Dst, cursor, patchLabels);
+            return EmitIndirectBranchWithInlineCache(Dst, patchLabels);
         } break;
         case ZYDIS_CATEGORY_INTERRUPT:
         case ZYDIS_CATEGORY_SYSCALL:
         {
-            if (!EmitAndPossiblyRelocateInstruction(cursor, Dst, currentPC, instr, operands))
+            bool emitted = EmitAndPossiblyRelocateInstruction(cursor, Dst, currentPC, instr, operands, patchLabels);
+            if (!emitted)
             {
                 PeonyLogf("Something went wrong emitting instructions for syscall/sysret");
                 return false;
             }
-            DbiEmitPatchableExit(Dst, (ExitPatchLabel){.targetAppPC = nextSeqAppPC}, patchLabels);
-            return DbiDynasmEncodeSnippet(Dst, cursor, *patchLabels);
+            DbiEmitPatchableExit(Dst, (CodePatchLabel){.targetAppPC = nextSeqAppPC}, patchLabels);
+            return true;
         } break;
         default:
         {
@@ -1599,7 +1557,7 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
     dasm_State* D = NULL;
     dasm_State** Dst = &D;
     DbiDynasmInit(Dst);
-    ExitPatchLabel* patchLabels = NULL;
+    CodePatchLabel* patchLabels = NULL;
 
     if (!CodeCacheInit(appPc))
     {
@@ -1669,12 +1627,19 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
             break;
         }
 
-        if (!EmitAndPossiblyRelocateInstruction(&codeOut, Dst, currentPC, &instr, operands))
+        bool emitted = EmitAndPossiblyRelocateInstruction(&codeOut, Dst, currentPC, &instr, operands, &patchLabels);
+        if (!emitted)
         {
             LogDecodedInstructionRange("failed to emit/relocate instruction", &decoder, &fmt, currentPC, instr.length);
             goto error;
         }
         currentPC += instr.length;
+    }
+
+    bool encoded = DbiDynasmEncode(Dst, &codeOut, patchLabels);
+    if (!encoded)
+    {
+        goto error;
     }
 
     FlushInstructionCache(GetCurrentProcess(), blockStart, codeOut.cursor - blockStart);
