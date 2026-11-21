@@ -14,11 +14,7 @@ if "%~1"=="" (
 )
 
 :testerRun
-set "testerExe=%BUILD%/tester.exe"
-for /f "tokens=*" %%A in ('powershell -Command "(Start-Process '%testerExe%' -PassThru).Id"') do set "PID=%%A"
-
-echo Launched test process at PID = %PID%
-"%BUILD%/main.exe" --pid %PID%
+"%BUILD%/main.exe" --run "%BUILD%/tester.exe"
 if errorlevel 1 goto :fail
 
 :success

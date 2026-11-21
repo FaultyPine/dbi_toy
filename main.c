@@ -1,13 +1,12 @@
 
 
 // This is the main runner program for this DBI engine
-// you can point it at a process/thread id and it'll call injection.c to instrument the process/thread
+// launches a program suspended and calls injection.c to instrument its initial thread
 // this program also handles some communication with the remote process - like pumping logs and coordinating other params
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <windows.h>
-#include <tlhelp32.h>
 #include <string.h>
 
 #include "shared_defines.h"
@@ -25,9 +24,6 @@
 
 typedef struct 
 {
-    int pid;
-    DWORD targetThreadId;
-    char exeName[MAX_PATH];
     char runPath[MAX_PATH];
     const char* runArgs;
 } GlobalState;
@@ -226,11 +222,8 @@ DWORD WINAPI InjectedLogPumpThread(LPVOID param)
 
 // =========== CMDLINE ARG PARSING ===============
 #define DECLARE_CMDLINE_ARGS \
-    X(pid, ParsePid) \
-    X(exename, ParseExeName) \
     X(run, ParseRunPath) \
-    X(runArgs, ParseRunArgs) \
-    X(targetThreadId, ParseTargetThreadId)
+    X(runArgs, ParseRunArgs)
 
 typedef enum
 {
@@ -251,18 +244,6 @@ const char* CmdlineArgToString(CmdlineArg arg)
     }
 }
 
-void CmdlineArgNoParse(const char* content) {};
-
-void ParsePid(const char* content)
-{
-    g_state.pid = atoi(content);
-}
-
-void ParseExeName(const char* content)
-{
-    strncpy_s(g_state.exeName, sizeof(g_state.exeName), content, MAX_PATH);
-}
-
 void ParseRunPath(const char* content)
 {
     strncpy_s(g_state.runPath, sizeof(g_state.runPath), content, MAX_PATH);
@@ -271,11 +252,6 @@ void ParseRunPath(const char* content)
 void ParseRunArgs(const char* content)
 {
     g_state.runArgs = content;
-}
-
-void ParseTargetThreadId(const char* content)
-{
-    g_state.targetThreadId = (DWORD)strtoul(content, NULL, 10);
 }
 
 typedef void(*CmdlineParseContent)(const char*);
@@ -294,49 +270,6 @@ typedef struct
     HANDLE remoteThreadHdl;
     void* remoteMem;
 } RemoteProcInfo;
-
-DWORD FindPidByExeName(const char* exeName)
-{
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE)
-    {
-        PeonyLogf("CreateToolhelp32Snapshot failed: %lu\n", GetLastError());
-        return 0;
-    }
-
-    PROCESSENTRY32 entry = {0};
-    entry.dwSize = sizeof(entry);
-
-    DWORD pid = 0;
-    if (Process32First(snapshot, &entry))
-    {
-        do
-        {
-            if (_strnicmp(exeName, entry.szExeFile, MAX_PATH) == 0)
-            {
-                pid = entry.th32ProcessID;
-                break;
-            }
-        } while (Process32Next(snapshot, &entry));
-    }
-
-    CloseHandle(snapshot);
-    return pid;
-}
-
-DWORD WaitForPidByExeName(const char* exeName)
-{
-    PeonyLogf("Waiting for executable \"%s\"...\n", exeName);
-    for (;;)
-    {
-        DWORD pid = FindPidByExeName(exeName);
-        if (pid != 0)
-        {
-            return pid;
-        }
-        Sleep(1000);
-    }
-}
 
 RemoteProcInfo InjectCodeIntoProcess(int pid, const char* sharedLibPath)
 {
@@ -404,72 +337,64 @@ int main(int argc, char** argv)
     {
         const char* arg = argv[i];
         arg = EatChars(arg, "--");
+        bool recognized = false;
         for (CmdlineArg cmdlineArg = 0; cmdlineArg < CMDLINE_ARGS_COUNT; cmdlineArg++)
         {
             if (strcmp(arg, CmdlineArgToString(cmdlineArg)) == 0)
             {
                 if (i + 1 >= argc)
                 {
-                    PeonyLogf("Missing value for --%s.\n", CmdlineArgToString(cmdlineArg));
+                    fprintf(stderr, "Missing value for --%s.\n", CmdlineArgToString(cmdlineArg));
                     return 1;
                 }
                 cmdlineParsers[cmdlineArg](argv[i+1]);
                 i++;
+                recognized = true;
                 break;
             }
         }
-    }
-
-    if (g_state.runPath[0] != '\0')
-    {
-        char commandLine[32768];
-        int length = snprintf(commandLine, sizeof(commandLine), "\"%s\" %s",
-            g_state.runPath, g_state.runArgs ? g_state.runArgs : "");
-        if (length < 0 || length >= sizeof(commandLine))
+        if (!recognized)
         {
-            PeonyLogf("Target command line is too long.\n");
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
             return 1;
         }
-        STARTUPINFOA startupInfo = {0};
-        startupInfo.cb = sizeof(startupInfo);
-        if (!CreateProcessA(
-                g_state.runPath,
-                commandLine,
-                NULL,
-                NULL,
-                FALSE,
-                CREATE_SUSPENDED,
-                NULL,
-                NULL,
-                &startupInfo,
-                &launchedProcess))
-        {
-            PeonyLogf("CreateProcessA(\"%s\") failed: %lu\n", g_state.runPath, GetLastError());
-            return 1;
-        }
-
-        g_state.pid = (int)launchedProcess.dwProcessId;
-        if (g_state.targetThreadId == 0)
-        {
-            g_state.targetThreadId = launchedProcess.dwThreadId;
-        }
-        PeonyLogf("Started \"%s\" suspended.\n", g_state.runPath);
-    }
-    else if (g_state.pid == 0 && g_state.exeName[0] != '\0')
-    {
-        g_state.pid = (int)WaitForPidByExeName(g_state.exeName);
     }
 
-    if (g_state.pid == 0)
+    if (g_state.runPath[0] == '\0')
     {
-        // no pid supplied, we should prompt the user
-        PeonyLogf("Enter PID to attach to: ");
-        char pidStr[50];
-        fgets(pidStr, sizeof(pidStr), stdin);
-        sscanf_s(pidStr, "%d", &g_state.pid);
+        fprintf(stderr, "Usage: %s --run <executable> [--runArgs <arguments>]\n", argv[0]);
+        return 1;
     }
-    PeonyLogf("PID = %i\n", g_state.pid);
-    PeonyLogf("Target thread ID = %lu\n", g_state.targetThreadId);
+
+    char commandLine[32768];
+    int length = snprintf(commandLine, sizeof(commandLine), "\"%s\" %s",
+        g_state.runPath, g_state.runArgs ? g_state.runArgs : "");
+    if (length < 0 || length >= sizeof(commandLine))
+    {
+        PeonyLogf("Target command line is too long.\n");
+        return 1;
+    }
+    STARTUPINFOA startupInfo = {0};
+    startupInfo.cb = sizeof(startupInfo);
+    if (!CreateProcessA(
+            g_state.runPath,
+            commandLine,
+            NULL,
+            NULL,
+            FALSE,
+            CREATE_SUSPENDED,
+            NULL,
+            NULL,
+            &startupInfo,
+            &launchedProcess))
+    {
+        PeonyLogf("CreateProcessA(\"%s\") failed: %lu\n", g_state.runPath, GetLastError());
+        return 1;
+    }
+
+    PeonyLogf("Started \"%s\" suspended.\n", g_state.runPath);
+    PeonyLogf("PID = %lu\n", launchedProcess.dwProcessId);
+    PeonyLogf("Target thread ID = %lu\n", launchedProcess.dwThreadId);
 
 #if PEONY_PUMP_INJECTED_LOGS
     HANDLE logPumpThread = NULL;
@@ -509,14 +434,14 @@ int main(int argc, char** argv)
     }
 #endif
 
-    SharedCommsObject* sharedComms = SharedCommsInitializeForProcess(g_state.pid);
+    SharedCommsObject* sharedComms = SharedCommsInitializeForProcess(launchedProcess.dwProcessId);
     if (!sharedComms)
     {
         exitCode = 1;
         goto cleanup;
     }
     *sharedComms = (SharedCommsObject){0};
-    sharedComms->targetThreadId = g_state.targetThreadId;
+    sharedComms->targetThreadId = launchedProcess.dwThreadId;
 
     char injectionDllPath[MAX_PATH];
     DWORD executablePathLength = GetModuleFileNameA(NULL, injectionDllPath, sizeof(injectionDllPath));
@@ -538,7 +463,7 @@ int main(int argc, char** argv)
     }
     strcpy_s(executableName + 1, sizeof(injectionDllPath) - (size_t)(executableName + 1 - injectionDllPath), INJECTION_DLL_NAME);
 
-    remoteProcInfo = InjectCodeIntoProcess(g_state.pid, injectionDllPath);
+    remoteProcInfo = InjectCodeIntoProcess(launchedProcess.dwProcessId, injectionDllPath);
     if (!remoteProcInfo.remoteProcHdl)
     {
         PeonyLogf("Main injector process: attach failed.\n");

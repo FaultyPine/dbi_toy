@@ -3,7 +3,9 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
+#endif
 
 #define STRINGIFY(x) #x
 #define STRINGIFY_MACRO(x) STRINGIFY(x)
