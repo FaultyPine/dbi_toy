@@ -1,7 +1,6 @@
 
 Only for x64 windows.
-Building: run `build.bat`
-
+Building: run `build.bat`. Or `build.bat release` for an optimized build
 trying to learn how to write a DBI engine
 
 
