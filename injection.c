@@ -16,6 +16,7 @@
 #include <string.h>
 #include <windows.h>
 #include <TlHelp32.h>
+#define _NO_CVCONST_H
 #include <dbghelp.h>
 #include <intrin.h>
 #include "Zydis.h"
@@ -2109,6 +2110,91 @@ static bool DbiInitializeExtendedState(void)
     return true;
 }
 
+typedef struct
+{
+    ULONG index;
+    uintptr_t address;
+    ULONG size;
+} FunctionSymbol;
+
+static BOOL CALLBACK CollectFunctionSymbol(PSYMBOL_INFO symbol, ULONG size, PVOID context)
+{
+    (void)size;
+    if (symbol->Tag == SymTagFunction)
+    {
+        FunctionSymbol** functions = (FunctionSymbol**)context;
+        FunctionSymbol function = {0};
+        function.index = symbol->Index;
+        function.address = (uintptr_t)symbol->Address;
+        function.size = symbol->Size;
+        arrput(*functions, function);
+    }
+    return TRUE;
+}
+
+static void PrintMainModuleFunctions(void)
+{
+    HMODULE module = GetModuleHandleA(NULL);
+    char path[MAX_PATH];
+    DWORD length = GetModuleFileNameA(module, path, sizeof(path));
+    if (length == 0 || length >= sizeof(path))
+    {
+        PeonyLogf("Failed to get main executable path: %lu", GetLastError());
+        return;
+    }
+
+    HANDLE process = GetCurrentProcess();
+    DWORD options = SymGetOptions();
+    SymSetOptions((options & ~(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_ANYTHING)) | SYMOPT_EXACT_SYMBOLS);
+    bool initialized = SymInitialize(process, NULL, FALSE);
+    if (!initialized)
+    {
+        PeonyLogf("SymInitialize failed: %lu", GetLastError());
+        SymSetOptions(options);
+        return;
+    }
+
+    DWORD64 base = (DWORD64)(uintptr_t)module;
+    SetLastError(ERROR_SUCCESS);
+    DWORD64 loaded = SymLoadModuleEx(process, NULL, path, NULL, base, 0, NULL, 0);
+    DWORD loadError = GetLastError();
+    bool moduleLoaded = loaded != 0 || loadError == ERROR_SUCCESS;
+    IMAGEHLP_MODULE64 info = {.SizeOfStruct = sizeof(info)};
+    bool gotModuleInfo = SymGetModuleInfo64(process, base, &info);
+    if (!moduleLoaded || !gotModuleInfo || info.SymType != SymPdb || info.PdbUnmatched)
+    {
+        PeonyLogf("Could not load a matching PDB for %s (error %lu).", path,
+            moduleLoaded ? GetLastError() : loadError);
+    }
+    else
+    {
+        PeonyLogf("Loaded main executable PDB: %s", info.LoadedPdbName);
+        FunctionSymbol* functions = NULL;
+        bool enumerated = SymEnumSymbols(process, base, NULL, CollectFunctionSymbol, &functions);
+        if (!enumerated)
+        {
+            PeonyLogf("SymEnumSymbols failed: %lu", GetLastError());
+        }
+        for (int i = 0; i < arrlen(functions); i++)
+        {
+            FunctionSymbol* function = &functions[i];
+            char symbolStorage[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {0};
+            SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbolStorage;
+            symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+            symbol->MaxNameLen = MAX_SYM_NAME;
+            bool foundSymbol = SymFromIndex(process, base, function->index, symbol);
+            if (!foundSymbol)
+            {
+                PeonyLogf("SymFromIndex failed for symbol %lu: %lu", function->index, GetLastError());
+                continue;
+            }
+            PeonyLogf("Function %s: address=%p size=%lu", symbol->Name, (void*)function->address, function->size);
+        }
+        arrfree(functions);
+    }
+    SymSetOptions(options);
+}
+
 #define DEBUG_PICK_THREAD_CONTAINS_NAME "main"
 
 void Initialize()
@@ -2126,6 +2212,7 @@ void Initialize()
         return;
     }
 
+    PrintMainModuleFunctions();
     ModuleInfo* moduleInfos = ListProcessModules(pid);
     PeonyLogf("Target thread id from shared comms: %lu", sharedComms->targetThreadId);
 #ifdef DEBUG_PICK_THREAD_CONTAINS_NAME
