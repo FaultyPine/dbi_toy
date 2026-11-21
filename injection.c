@@ -191,8 +191,9 @@ typedef struct
 #define CODE_CACHE_BLOCK_INITAL_RESERVE_SIZE (4096*5)
 
 static ThreadHijackState g_hijackedThreadState;
-static uint32_t g_xsaveMaskLow;
-static uint32_t g_xsaveMaskHigh;
+// release builds caused linker errors without this attribute. They're referenced by name in the inline asm
+static uint32_t g_xsaveMaskLow __attribute__((used));
+static uint32_t g_xsaveMaskHigh __attribute__((used));
 
 #define DBI_ZYDIS_DISPATCH_REG ZYDIS_REGISTER_R11
 #define DBI_ZYDIS_STATE_REG ZYDIS_REGISTER_R10
