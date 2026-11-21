@@ -14,3 +14,6 @@ currently supports:
 TODO:
 - split up the code cache to be allocated near the code modules
 
+
+DynamoRIO phd paper, lots of extremely valuable insights here
+https://www.burningcutlery.com/derek/docs/phd.pdf
