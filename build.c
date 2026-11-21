@@ -16,8 +16,16 @@ static BuildMode g_buildMode = DEBUG;
 
 static void append_build_flags(Nob_Cmd *cmd)
 {
-    if (g_buildMode == RELEASE) nob_cmd_append(cmd, "-O2", "-DNDEBUG");
-    else nob_cmd_append(cmd, "-O0", "-g");
+    // Use the same static CRT as Zydis and Zycore in both build modes.
+    nob_cmd_append(cmd, "-fms-runtime-lib=static");
+    if (g_buildMode == RELEASE)
+    {
+        nob_cmd_append(cmd, "-O2", "-DNDEBUG");
+    }
+    else
+    {
+        nob_cmd_append(cmd, "-O0", "-g");
+    }
 }
 
 static bool require_file(const char *path)
@@ -65,8 +73,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    bool needsZydisBuild = !nob_file_exists(zydisLib) || !nob_file_exists(zycoreLib);
-
     // zydis configure
     Nob_Cmd zydisConfigure = {0};
     nob_cmd_append(&zydisConfigure,
@@ -74,6 +80,7 @@ int main(int argc, char **argv)
                    "-S", ZYDIS_ROOT,
                    "-B", ZYDIS_BUILD,
                    "-A", "x64",
+                   "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
                    "-DZYDIS_BUILD_EXAMPLES=OFF",
                    "-DZYDIS_BUILD_TOOLS=OFF",
                    "-DZYDIS_BUILD_TESTS=OFF",
@@ -142,8 +149,16 @@ int main(int argc, char **argv)
     nob_cmd_append(&tester, CLANG, "tester.c", "-o", BUILD_DIR "/tester.exe", "-luser32");
     append_build_flags(&tester);
 
-    if (needsZydisBuild && !nob_cmd_run(&zydisConfigure)) return 1;
-    if (needsZydisBuild && !nob_cmd_run(&zydis)) return 1;
+    bool zydisConfigured = nob_cmd_run(&zydisConfigure);
+    if (!zydisConfigured)
+    {
+        return 1;
+    }
+    bool zydisBuilt = nob_cmd_run(&zydis);
+    if (!zydisBuilt)
+    {
+        return 1;
+    }
     if (!nob_file_exists(zydisLib))
     {
         nob_log(NOB_ERROR, "expected Zydis library was not produced: `%s`", zydisLib);
