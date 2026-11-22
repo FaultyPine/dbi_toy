@@ -139,6 +139,8 @@ int main(int argc, char **argv)
                    "-lbcrypt",
                    "-DZYDIS_STATIC_BUILD",
                    "-DZYCORE_STATIC_BUILD",
+                   "-D_CRT_SECURE_NO_WARNINGS",
+                   "-Iexternal/libpdb/include",
                    "-I.",
                    "-I" MIMALLOC_ROOT "/include",
                    "-Iexternal/LuaJIT/dynasm");
