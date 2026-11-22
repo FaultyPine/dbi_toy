@@ -14,9 +14,17 @@ char* sharedLogMappingName = "Peony_LogMapping";
 
 #define PEONY_LOG_BUFFER_SIZE (100 * MB)
 
+typedef enum
+{
+    SHAREDCOMMS_INITSTATUS_PREPARING = 0,
+    SHAREDCOMMS_INITSTATUS_READY,
+    SHAREDCOMMS_INITSTATUS_FAILED,
+} DbiInitializeStatus;
+
 typedef struct 
 {
     DWORD targetThreadId;
+    volatile DbiInitializeStatus initializationStatus;
 } SharedCommsObject;
 
 typedef struct

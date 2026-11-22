@@ -16,7 +16,8 @@
 #include <string.h>
 #include <windows.h>
 #include <TlHelp32.h>
-#define _NO_CVCONST_H
+// Use libpdb's CodeView definitions instead of DbgHelp's fallback enums.
+#include "pdb/cvconst.h"
 #include <dbghelp.h>
 #include <intrin.h>
 #include "Zydis.h"
@@ -45,6 +46,11 @@
 #else
 #include "external/mimalloc/src/static.c"
 #endif
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wmicrosoft-anon-tag"
+#include "external/libpdb/src/pdb.c"
+#pragma clang diagnostic pop
 
 static bool DbiAllocatorInit(void);
 static void* DbiRealloc(void* ptr, size_t size);
@@ -152,16 +158,31 @@ typedef struct
     uint8_t* codeCachePc;
 } ExitPatchSite;
 
-// Labels for exits and RIP-relative operands that need their final code address.
+typedef enum
+{
+    CODE_LABEL_EXIT,
+    CODE_LABEL_RIP_RELATIVE,
+    CODE_LABEL_EIP_RELATIVE,
+} CodePatchLabelType;
+
+// Labels whose final addresses are resolved after encoding.
 typedef struct
 {
-    uintptr_t targetAppPC;
+    CodePatchLabelType type;
     int label;
-    // for rip-relative relocation, which gets backpatched
-    bool ripRelative;
-    bool eipRelative;
-    uint8_t instructionLength;
-    uint8_t displacementOffset;
+    union
+    {
+        struct
+        {
+            uintptr_t targetAppPC;
+        } exit;
+        struct
+        {
+            uintptr_t targetAppPC;
+            uint8_t instructionLength;
+            uint8_t displacementOffset;
+        } relocation;
+    };
 } CodePatchLabel;
 
 typedef struct
@@ -690,7 +711,7 @@ static bool CodeCacheAddPendingPatch(
         return false;
     }
     uint8_t* patchSite = base + offset;
-    uintptr_t targetAppPC = patchLabel->targetAppPC;
+    uintptr_t targetAppPC = patchLabel->exit.targetAppPC;
 
     PendingExitPatchEntry* entry = g_pendingExitPatches
         ? hmgetp_null(g_pendingExitPatches, targetAppPC)
@@ -745,7 +766,7 @@ static bool DbiDynasmEncode(dasm_State** Dst, CodeCursor* cursor, CodePatchLabel
         // when we encountered a rip relative instr, we recorded info about it here
         // we use that info to backpatch it with the correct displacement, since we only know the correct displacement
         // after we've compiled the full block and know exactly where it's going.
-        if (patch->ripRelative)
+        if (patch->type == CODE_LABEL_RIP_RELATIVE || patch->type == CODE_LABEL_EIP_RELATIVE)
         {
             int offset = dasm_getpclabel(Dst, patch->label);
             if (offset < 0)
@@ -753,20 +774,20 @@ static bool DbiDynasmEncode(dasm_State** Dst, CodeCursor* cursor, CodePatchLabel
                 PeonyLogf("DynASM relocation label %d was not resolved", patch->label);
                 return false;
             }
-            uintptr_t nextRip = (uintptr_t)(base + offset + patch->instructionLength);
-            bool reachable = patch->eipRelative || IsRel32Reachable(nextRip, patch->targetAppPC);
+            uintptr_t nextRip = (uintptr_t)(base + offset + patch->relocation.instructionLength);
+            bool reachable = patch->type == CODE_LABEL_EIP_RELATIVE || IsRel32Reachable(nextRip, patch->relocation.targetAppPC);
             if (!reachable)
             {
-                PeonyLogf("RIP-relative target %p is out of reach from %p", (void*)patch->targetAppPC, (void*)nextRip);
+                PeonyLogf("RIP-relative target %p is out of reach from %p", (void*)patch->relocation.targetAppPC, (void*)nextRip);
                 return false;
             }
-            uint32_t displacement = (uint32_t)patch->targetAppPC - (uint32_t)nextRip;
-            memcpy(base + offset + patch->displacementOffset, &displacement, sizeof(displacement));
+            uint32_t displacement = (uint32_t)patch->relocation.targetAppPC - (uint32_t)nextRip;
+            memcpy(base + offset + patch->relocation.displacementOffset, &displacement, sizeof(displacement));
         }
     }
     for (int i = 0; i < arrlen(patchLabels); i++)
     {
-        if (!patchLabels[i].ripRelative)
+        if (patchLabels[i].type == CODE_LABEL_EXIT)
         {
             bool added = CodeCacheAddPendingPatch(Dst, &patchLabels[i], base);
             if (!added)
@@ -845,10 +866,8 @@ static void CodeCachePatchPendingExits(uintptr_t blockStartPC, uint8_t* targetCo
     hmdel(g_pendingExitPatches, blockStartPC);
 }
 
-static void CodeCachePublishBlock(uintptr_t appPc, uintptr_t appEndPc, CodeCursor* cursor)
+static void CodeCachePublish(uintptr_t appPc, uintptr_t appEndPc, uint8_t* blockStart, uint8_t* blockEnd)
 {
-    uint8_t* blockStart = cursor->reservation_start;
-    uint8_t* blockEnd = cursor->cursor;
     CodeCacheBlock block = {
         .codeCachePc = blockStart,
         .appBytes = appEndPc - appPc,
@@ -856,8 +875,6 @@ static void CodeCachePublishBlock(uintptr_t appPc, uintptr_t appEndPc, CodeCurso
     };
     hmput(g_codeCache.entries, appPc, block);
     CodeCachePatchPendingExits(appPc, blockStart);
-    // now that we know the real size of the code block, rather than the inital guess, reclaim the unused space
-    CodeCacheReclaimUnusedReservation(cursor);
 }
 
 // tries to initialize code cache memory within rel32 range of 'nearPc'
@@ -1045,12 +1062,13 @@ bool EmitAndPossiblyRelocateInstruction(
         if (reachable)
         {
             CodePatchLabel patch = {
-                .targetAppPC = (uintptr_t)target,
+                .type = eipRelative ? CODE_LABEL_EIP_RELATIVE : CODE_LABEL_RIP_RELATIVE,
                 .label = arrlen(*patchLabels),
-                .ripRelative = true,
-                .eipRelative = eipRelative,
-                .instructionLength = instr->length,
-                .displacementOffset = instr->raw.disp.offset,
+                .relocation = {
+                    .targetAppPC = (uintptr_t)target,
+                    .instructionLength = instr->length,
+                    .displacementOffset = instr->raw.disp.offset,
+                },
             };
             dasm_growpc(Dst, patch.label + 1);
             |=>patch.label:
@@ -1150,27 +1168,28 @@ static void DbiEmitExitTrampoline(
 // returns the code cache mapped to the targetAppPC
 static bool DbiEmitPatchableExit(
     dasm_State** Dst, 
-    CodePatchLabel patchLabel,
+    uintptr_t targetAppPC,
     CodePatchLabel** patchLabels)
 {
-    uint8_t* targetCodeCachePC = CodeCacheLookup(patchLabel.targetAppPC);
+    uint8_t* targetCodeCachePC = CodeCacheLookup(targetAppPC);
     if (targetCodeCachePC)
     {
         | jmp &targetCodeCachePC
         return true;
     }
 
-    if (patchLabel.label <= 0)
-    {
-        patchLabel.label = arrlen(*patchLabels);
-        dasm_growpc(Dst, patchLabel.label + 1);
-    }
+    CodePatchLabel patchLabel = {
+        .type = CODE_LABEL_EXIT,
+        .label = arrlen(*patchLabels),
+        .exit = {.targetAppPC = targetAppPC},
+    };
+    dasm_growpc(Dst, patchLabel.label + 1);
 
     arrput(*patchLabels, patchLabel);
 
     |=>patchLabel.label:
     // the bytes here (emitted in the below function) are what gets backpatched
-    DbiEmitExitTrampoline(Dst, patchLabel.targetAppPC);
+    DbiEmitExitTrampoline(Dst, targetAppPC);
     return true;
 }
 
@@ -1377,7 +1396,7 @@ bool CompileBlockTerminator(
             // direct call EX: "call 0x00007FF6327770A8"
             if (GetDirectRelativeTarget(instr, operands, currentPC, &targetAddress))
             {
-                DbiEmitPatchableExit(Dst, (CodePatchLabel){.targetAppPC = targetAddress}, patchLabels);
+                DbiEmitPatchableExit(Dst, targetAddress, patchLabels);
                 return true;
             }
             // memory indirect call EX: "call qword ptr [rip + 0x1234]"
@@ -1430,7 +1449,7 @@ bool CompileBlockTerminator(
             // immediate jmp EX: jmp 0xDEADBEEF
             if (GetDirectRelativeTarget(instr, operands, currentPC, &targetAddress))
             {
-                DbiEmitPatchableExit(Dst, (CodePatchLabel){.targetAppPC = targetAddress}, patchLabels);
+                DbiEmitPatchableExit(Dst, targetAddress, patchLabels);
                 return true;
             }
             // memory indirect jmp EX: "jmp qword ptr [rip + 0x1234]"
@@ -1513,9 +1532,9 @@ bool CompileBlockTerminator(
                 PeonyLogf("Unsupported conditional branch Jcc code at %p", currentPC);
                 return false;
             }
-            DbiEmitPatchableExit(Dst, (CodePatchLabel){.targetAppPC = nextSeqAppPC}, patchLabels);
+            DbiEmitPatchableExit(Dst, nextSeqAppPC, patchLabels);
             |1:
-            DbiEmitPatchableExit(Dst, (CodePatchLabel){.targetAppPC = targetAddress}, patchLabels);
+            DbiEmitPatchableExit(Dst, targetAddress, patchLabels);
             return true;
         } break;
         case ZYDIS_CATEGORY_RET:
@@ -1533,7 +1552,7 @@ bool CompileBlockTerminator(
                 PeonyLogf("Something went wrong emitting instructions for syscall/sysret");
                 return false;
             }
-            DbiEmitPatchableExit(Dst, (CodePatchLabel){.targetAppPC = nextSeqAppPC}, patchLabels);
+            DbiEmitPatchableExit(Dst, nextSeqAppPC, patchLabels);
             return true;
         } break;
         default:
@@ -1545,6 +1564,29 @@ bool CompileBlockTerminator(
     return false;
 }
 
+typedef struct
+{
+    ULONG index;
+    uintptr_t address;
+    ULONG size;
+} FunctionSymbol;
+
+typedef enum
+{
+    DBI_COMPILE_MODE_BASIC_BLOCK,
+    DBI_COMPILE_MODE_FUNCTION,
+} DbiCompileMode;
+
+typedef struct
+{
+    DbiCompileMode mode;
+    union
+    {
+        FunctionSymbol* function; // compiling a whole function
+        uintptr_t appPc; // compiling a basic block
+    };
+} DbiCompileParams;
+
 // TODO: interesting idea: what if we removed the execute permissions on the pages of memory for modules we care about
 // and install an exception handler to catch when any thread tries to execute that code. 
 // Then we dbilookuporcompile, restore exe permissions, and jump to the code cache
@@ -1552,14 +1594,16 @@ bool CompileBlockTerminator(
 // instead of what we have now where we just pick a single thread and start jitting from there
 
 
-uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
+uint8_t* DbiCompile(DbiCompileParams params)
 {
     dasm_State* D = NULL;
     dasm_State** Dst = &D;
     DbiDynasmInit(Dst);
     CodePatchLabel* patchLabels = NULL;
 
-    if (!CodeCacheInit(appPc))
+    uint64_t appPc = params.mode == DBI_COMPILE_MODE_BASIC_BLOCK ? params.appPc : params.function->address;
+    uint64_t currentPC = appPc;
+    if (!CodeCacheInit(currentPC))
     {
         goto error;
     }
@@ -1591,7 +1635,6 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
     //     goto error;
     // }
 
-    uint64_t currentPC = appPc;
     // code emitting "cursor". this points to the code cache we need to write the jitted instructions to
     CodeCursor codeOut = {.reservation_start = blockStart, .cursor = blockStart, .capacity = reserveSize}; 
 
@@ -1607,7 +1650,17 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
 
         ZydisDecodedInstruction instr;
         ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-        ZyanStatus status = ZydisDecoderDecodeFull(&decoder, (void*)currentPC, ZYDIS_MAX_INSTRUCTION_LENGTH, &instr, operands);
+        size_t bytesAvailable = ZYDIS_MAX_INSTRUCTION_LENGTH;
+        // make sure we dont decode past the end of the function
+        if (params.mode == DBI_COMPILE_MODE_FUNCTION)
+        {
+            size_t remaining = params.function->size - (currentPC - appPc);
+            if (remaining < bytesAvailable)
+            {
+                bytesAvailable = remaining;
+            }
+        }
+        ZyanStatus status = ZydisDecoderDecodeFull(&decoder, (void*)currentPC, bytesAvailable, &instr, operands);
         if (ZYAN_FAILED(status))
         {
             PeonyLogf("Failed to decode instruction at %p: %lu", (void*)currentPC, status);
@@ -1616,24 +1669,37 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
         
         // we've hit an instruction like a branch or ret or call that "ends" the current basic block
         // for these, we need to emit some special code that 
-        if (IsBasicBlockTerminator(&instr))
+        bool isTerminator = IsBasicBlockTerminator(&instr);
+        if (isTerminator)
         {
             if (!CompileBlockTerminator(&codeOut, currentPC, &instr, operands, Dst, &patchLabels))
             {
                 LogDecodedInstructionRange("Terminator that failed to compile", &decoder, &fmt, currentPC, instr.length);
                 goto error;
             }
-            currentPC += instr.length;
-            break;
         }
-
-        bool emitted = EmitAndPossiblyRelocateInstruction(&codeOut, Dst, currentPC, &instr, operands, &patchLabels);
-        if (!emitted)
+        else
         {
-            LogDecodedInstructionRange("failed to emit/relocate instruction", &decoder, &fmt, currentPC, instr.length);
-            goto error;
+            bool emitted = EmitAndPossiblyRelocateInstruction(&codeOut, Dst, currentPC, &instr, operands, &patchLabels);
+            if (!emitted)
+            {
+                LogDecodedInstructionRange("failed to emit/relocate instruction", &decoder, &fmt, currentPC, instr.length);
+                goto error;
+            }
         }
         currentPC += instr.length;
+        
+        bool shouldStopCompiling =  (params.mode == DBI_COMPILE_MODE_BASIC_BLOCK && isTerminator) ||
+                                    (params.mode == DBI_COMPILE_MODE_FUNCTION    && currentPC >= appPc + params.function->size);
+        if (shouldStopCompiling)
+        {
+            if (!isTerminator)
+            {
+                // if for some reason a function ends without a terminator, dispatch to the next original address
+                DbiEmitPatchableExit(Dst, currentPC, &patchLabels);
+            }
+            break;
+        }
     }
 
     bool encoded = DbiDynasmEncode(Dst, &codeOut, patchLabels);
@@ -1641,11 +1707,15 @@ uint8_t* DbiCompileBasicBlock(uintptr_t appPc)
     {
         goto error;
     }
-
-    FlushInstructionCache(GetCurrentProcess(), blockStart, codeOut.cursor - blockStart);
-
-    CodeCachePublishBlock(appPc, currentPC, &codeOut);
     
+    FlushInstructionCache(GetCurrentProcess(), blockStart, codeOut.cursor - blockStart);
+    
+    // NOTE: it is possible for code to jump to the middle of a block
+    // currently, we don't handle that very well, since OnDBIExit will miss the code cache (since the hashmap entries are keyed on block start addrs)
+    // so we'll on-the-fly compile that code that we've already compiled elsewhere in the code cache. That's fine for now, but should probably get resolved later....
+    CodeCachePublish(appPc, currentPC, blockStart, codeOut.cursor);
+    CodeCacheReclaimUnusedReservation(&codeOut);
+
 #if DBI_LOG_COMPILATION_VERBOSE
     LogCompiledBasicBlockComparison(&decoder, &fmt, appPc, currentPC, blockStart, codeOut.cursor);
     PeonyLogf("There are now %llu entries in the code cache. code cache usage = %f%%", (unsigned long long)hmlenu(g_codeCache.entries), ((double)g_codeCache.used / (double)g_codeCache.capacity) * 100.0f);
@@ -1662,15 +1732,15 @@ error:
     return (uint8_t*)appPc;
 }
 
-uint8_t* DbiLookupOrCompile(uintptr_t appPc)
+uint8_t* DbiLookupOrCompile(DbiCompileParams params)
 {
-    uint8_t* existingCodeCacheEntryForThisPc = CodeCacheLookup(appPc);
+    uint8_t* existingCodeCacheEntryForThisPc = CodeCacheLookup(params.mode == DBI_COMPILE_MODE_BASIC_BLOCK ? params.appPc : params.function->address);
     if (existingCodeCacheEntryForThisPc)
     {
         return existingCodeCacheEntryForThisPc;
     }
     // we didn't find an entry in the code cache for this pc, we need to compile this basic block
-    return DbiCompileBasicBlock(appPc);
+    return DbiCompile(params);
 }
 
 __declspec(noinline)
@@ -1680,7 +1750,7 @@ void OnDBIExit(ThreadHijackState* state)
     #if DBI_LOG_COMPILATION_VERBOSE
     PeonyLogf("Dispatching to app PC %p", (void*)appTargetRip);
     #endif
-    uint8_t* codeCacheRip = DbiLookupOrCompile(appTargetRip);
+    uint8_t* codeCacheRip = DbiLookupOrCompile((DbiCompileParams){.mode = DBI_COMPILE_MODE_BASIC_BLOCK, .appPc = appTargetRip});
     state->savedRegs.Rip = (DWORD64)codeCacheRip;
     if (state->cacheToUpdate)
     {
@@ -2075,13 +2145,6 @@ static bool DbiInitializeExtendedState(void)
     return true;
 }
 
-typedef struct
-{
-    ULONG index;
-    uintptr_t address;
-    ULONG size;
-} FunctionSymbol;
-
 static BOOL CALLBACK CollectFunctionSymbol(PSYMBOL_INFO symbol, ULONG size, PVOID context)
 {
     (void)size;
@@ -2097,27 +2160,19 @@ static BOOL CALLBACK CollectFunctionSymbol(PSYMBOL_INFO symbol, ULONG size, PVOI
     return TRUE;
 }
 
-static void PrintMainModuleFunctions(void)
+static bool CompileModule(HMODULE module)
 {
-    HMODULE module = GetModuleHandleA(NULL);
     char path[MAX_PATH];
     DWORD length = GetModuleFileNameA(module, path, sizeof(path));
     if (length == 0 || length >= sizeof(path))
     {
         PeonyLogf("Failed to get main executable path: %lu", GetLastError());
-        return;
+        return false;
     }
-
+    bool result = true;
     HANDLE process = GetCurrentProcess();
     DWORD options = SymGetOptions();
     SymSetOptions((options & ~(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_ANYTHING)) | SYMOPT_EXACT_SYMBOLS);
-    bool initialized = SymInitialize(process, NULL, FALSE);
-    if (!initialized)
-    {
-        PeonyLogf("SymInitialize failed: %lu", GetLastError());
-        SymSetOptions(options);
-        return;
-    }
 
     DWORD64 base = (DWORD64)(uintptr_t)module;
     SetLastError(ERROR_SUCCESS);
@@ -2130,6 +2185,7 @@ static void PrintMainModuleFunctions(void)
     {
         PeonyLogf("Could not load a matching PDB for %s (error %lu).", path,
             moduleLoaded ? GetLastError() : loadError);
+        result = false;
     }
     else
     {
@@ -2139,6 +2195,7 @@ static void PrintMainModuleFunctions(void)
         if (!enumerated)
         {
             PeonyLogf("SymEnumSymbols failed: %lu", GetLastError());
+            result = false;
         }
         for (int i = 0; i < arrlen(functions); i++)
         {
@@ -2148,37 +2205,63 @@ static void PrintMainModuleFunctions(void)
             symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
             symbol->MaxNameLen = MAX_SYM_NAME;
             bool foundSymbol = SymFromIndex(process, base, function->index, symbol);
-            if (!foundSymbol)
+            if (!foundSymbol || function->size == 0)
             {
                 PeonyLogf("SymFromIndex failed for symbol %lu: %lu", function->index, GetLastError());
+                result = false;
                 continue;
             }
-            PeonyLogf("Function %s: address=%p size=%lu", symbol->Name, (void*)function->address, function->size);
+            uint8_t* compiledFunction = DbiLookupOrCompile((DbiCompileParams){.mode = DBI_COMPILE_MODE_FUNCTION, .function = function});
+            if ((uintptr_t)compiledFunction == function->address)
+            {
+                PeonyLogf("failed to compile! Function %s: address=%p size=%lu", symbol->Name, (void*)function->address, function->size);
+                result = false;
+            }
+            else
+            {
+                PeonyLogf("Function %s: address=%p size=%lu | compiled addr=%p", symbol->Name, (void*)function->address, function->size, compiledFunction);
+            }
         }
         arrfree(functions);
     }
     SymSetOptions(options);
+    return result;
 }
 
 #define DEBUG_PICK_THREAD_CONTAINS_NAME "main"
 
 void Initialize()
 {
+    bool dbiInitSuccess = false;
     SetUnhandledExceptionFilter(PeonyUnhandledExceptionFilter);
     PeonyLogf("Hello from injection dll! Zydis version = %llu", ZydisGetVersion());
-    if (!DbiInitializeExtendedState())
-    {
-        return;
-    }
-    DWORD pid = GetProcessId(GetCurrentProcess());
+
+    HANDLE process = GetCurrentProcess();
+    DWORD pid = GetProcessId(process);
     SharedCommsObject* sharedComms = SharedCommsInitializeForProcess(pid);
     if (!sharedComms)
     {
-        return;
+        PeonyLogf("failed to initialize Shared Comms\n");
+        goto cleanup;
     }
 
-    PrintMainModuleFunctions();
+    if (!DbiInitializeExtendedState())
+    {
+        PeonyLogf("failed to initialize Dbi Extended State\n");
+        goto cleanup;
+    }
+
+    bool initialized = SymInitialize(process, NULL, FALSE);
+    if (!initialized)
+    {
+        PeonyLogf("SymInitialize failed: %lu", GetLastError());
+        goto cleanup;
+    }
+
     ModuleInfo* moduleInfos = ListProcessModules(pid);
+    // TODO: filter list of modules basic on cmdline arg glob
+    HMODULE mainModule = GetModuleHandleA(NULL);
+    bool fullyCompiledMainModule = CompileModule(mainModule);
     PeonyLogf("Target thread id from shared comms: %lu", sharedComms->targetThreadId);
 #ifdef DEBUG_PICK_THREAD_CONTAINS_NAME
     if (sharedComms->targetThreadId == 0)
@@ -2209,5 +2292,15 @@ void Initialize()
         arrfree(threadInfos);
     }
 #endif
-    HijackThreadRip(sharedComms->targetThreadId);
+    if (fullyCompiledMainModule)
+    {
+        bool succesfullyHijacked = HijackThreadRip(sharedComms->targetThreadId);
+        dbiInitSuccess = fullyCompiledMainModule && succesfullyHijacked;
+    }
+cleanup:
+    if (sharedComms)
+    {
+        // no atomic needed, we're just a writer
+        sharedComms->initializationStatus = dbiInitSuccess ? SHAREDCOMMS_INITSTATUS_READY : SHAREDCOMMS_INITSTATUS_FAILED;
+    }
 }

@@ -442,6 +442,7 @@ int main(int argc, char** argv)
     }
     *sharedComms = (SharedCommsObject){0};
     sharedComms->targetThreadId = launchedProcess.dwThreadId;
+    sharedComms->initializationStatus = SHAREDCOMMS_INITSTATUS_PREPARING;
 
     char injectionDllPath[MAX_PATH];
     DWORD executablePathLength = GetModuleFileNameA(NULL, injectionDllPath, sizeof(injectionDllPath));
@@ -489,7 +490,21 @@ int main(int argc, char** argv)
             goto cleanup;
         }
 
-        PeonyLogf("DBI loaded; resuming target process.\n");
+        // before we let the target program go, make sure the DBI has gone through it's initialization logic
+        DbiInitializeStatus targetDbiInitStatus = sharedComms->initializationStatus;
+        while (targetDbiInitStatus == SHAREDCOMMS_INITSTATUS_PREPARING)
+        {
+            if (WaitForSingleObject(remoteProcInfo.remoteProcHdl, 50) != WAIT_TIMEOUT)
+            {
+                PeonyLogf("Target exited during DBI init\n");
+                exitCode = 1;
+                goto cleanup;
+            }
+            // dont need atomic, we're just a reader
+            targetDbiInitStatus = sharedComms->initializationStatus;
+        }
+
+        PeonyLogf("Resuming target process. (%s)\n", targetDbiInitStatus == SHAREDCOMMS_INITSTATUS_READY ? "DBI ready" : "Warning: DBI initialization failed. continuing without instrumentation");
         if (ResumeThread(launchedProcess.hThread) == (DWORD)-1)
         {
             PeonyLogf("ResumeThread failed: %lu\n", GetLastError());

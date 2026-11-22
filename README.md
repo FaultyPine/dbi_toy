@@ -11,6 +11,7 @@ currently supports:
 - backpatching code cache blocks (direct and indirect branches)
 
 TODO:
+- use libpdb to find the real start/end of function code. Excluding embedded data like jump tables
 - split up the code cache to be allocated near the code modules
 - handle indirect branches better
     - in a benchmark of compiling clang under this dbi, most of the time was spent on cache misses for returns
