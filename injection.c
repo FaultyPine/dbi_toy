@@ -260,6 +260,11 @@ static void DbiAllocatorFatalOutOfMemory(size_t size)
     TerminateProcess(GetCurrentProcess(), ERROR_OUTOFMEMORY);
 }
 
+static void* DbiAlloc(size_t size)
+{
+    return DbiRealloc(NULL, size);
+}
+
 static void* DbiRealloc(void* ptr, size_t size)
 {
     if (size == 0)
@@ -2162,18 +2167,22 @@ static BOOL CALLBACK CollectFunctionSymbol(PSYMBOL_INFO symbol, ULONG size, PVOI
 
 static bool CompileModule(HMODULE module)
 {
+    DWORD options = SymGetOptions();
+    FunctionSymbol* functions = NULL;
+
     char path[MAX_PATH];
     DWORD length = GetModuleFileNameA(module, path, sizeof(path));
+    bool result = true;
     if (length == 0 || length >= sizeof(path))
     {
         PeonyLogf("Failed to get main executable path: %lu", GetLastError());
-        return false;
+        result = false;
+        goto cleanup;
     }
-    bool result = true;
     HANDLE process = GetCurrentProcess();
-    DWORD options = SymGetOptions();
     SymSetOptions((options & ~(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_ANYTHING)) | SYMOPT_EXACT_SYMBOLS);
 
+    // TODO: use dbghelp to just download/find the symbols, and do everything else myself (https://blog.s-schoener.com/2025-01-27-dbghelp-symbols/)
     DWORD64 base = (DWORD64)(uintptr_t)module;
     SetLastError(ERROR_SUCCESS);
     DWORD64 loaded = SymLoadModuleEx(process, NULL, path, NULL, base, 0, NULL, 0);
@@ -2186,44 +2195,121 @@ static bool CompileModule(HMODULE module)
         PeonyLogf("Could not load a matching PDB for %s (error %lu).", path,
             moduleLoaded ? GetLastError() : loadError);
         result = false;
+        goto cleanup;
     }
-    else
+    PeonyLogf("Loaded main executable PDB: %s", info.LoadedPdbName);
+
+    
+#if 0
+    bool enumerated = SymEnumSymbols(process, base, NULL, CollectFunctionSymbol, &functions);
+    if (!enumerated)
     {
-        PeonyLogf("Loaded main executable PDB: %s", info.LoadedPdbName);
-        FunctionSymbol* functions = NULL;
-        bool enumerated = SymEnumSymbols(process, base, NULL, CollectFunctionSymbol, &functions);
-        if (!enumerated)
+        PeonyLogf("SymEnumSymbols failed: %lu", GetLastError());
+        result = false;
+    }
+#else
+    // TOOD: seperate this out into symbols.c file
+
+    void* pdbCtx = pdb_create_context(NULL, NULL);
+    // void* pdbCtx = pdb_create_context(DbiAlloc, DbiFree);
+    assert(pdbCtx);
+
+    char* pdbName = info.LoadedPdbName;
+    if (pdbName[0] == '\0')
+    {
+        PeonyLogf("Module was not build with symbols\n");
+        result = false;
+        goto cleanup;
+    }
+    char pdbAbsPath[MAX_PATH];
+    char* filePart = NULL;
+    DWORD pdbPathLen = GetFullPathNameA(pdbName, MAX_PATH, pdbAbsPath, &filePart);
+    if (pdbPathLen == 0)
+    {
+        PeonyLogf("Failed getting pdb full path\n");
+        result = false;
+        goto cleanup;
+    }
+    PeonyLogf("Pdb file: %s", pdbAbsPath);
+    
+    HANDLE pdbFile = CreateFile(pdbAbsPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD pdbFileSizeHi = 0;
+    DWORD pdbFileSizeLo = GetFileSize(pdbFile, &pdbFileSizeHi);
+    assert(pdbFileSizeHi == 0);
+    if (pdbFileSizeLo == INVALID_FILE_SIZE)
+    {
+        PeonyLogf("Failed to open PDB file\n");
+        result = false;
+        goto cleanup;
+    }
+    DWORD pdbFileSize = pdbFileSizeLo; // TODO: combine these two into u64
+    HANDLE pdbFilemapping = CreateFileMapping(
+        pdbFile,
+        NULL,
+        PAGE_READONLY,
+        0,
+        pdbFileSize,
+        NULL
+    );
+    LPVOID pdbdata = MapViewOfFile(
+        pdbFilemapping,
+        FILE_MAP_READ,
+        0, 0,
+        pdbFileSize
+    );
+    if (!pdbdata)
+    {
+        PeonyLogf("failed to map pdb file data %u\n", GetLastError());
+        result = false;
+        goto cleanup;
+    }
+
+    if (!pdb_sig_match(pdbdata, sizeof(info.PdbSig70)))
+    {
+        PeonyLogf("PDB Signature does not match\n");
+        result = false;
+        goto cleanup;
+    }
+
+
+    // TODO: libpdb docs say "At this point, the original backing storage for `pdbdata` can be safely freed."
+    // that means they probably copy the data into this process. I'd like to avoid that in the future, and just used the mmapped pdb file during parsing...
+    if (pdb_load(pdbCtx, pdbdata, pdbFileSize))
+    {
+        PeonyLogf("Failed to load pdb\n");
+        result = false;
+        goto cleanup;
+    }
+
+#endif
+
+    for (int i = 0; i < arrlen(functions); i++)
+    {
+        FunctionSymbol* function = &functions[i];
+        char symbolStorage[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {0};
+        SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbolStorage;
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = MAX_SYM_NAME;
+        bool foundSymbol = SymFromIndex(process, base, function->index, symbol);
+        if (!foundSymbol || function->size == 0)
         {
-            PeonyLogf("SymEnumSymbols failed: %lu", GetLastError());
+            PeonyLogf("SymFromIndex failed for symbol %lu: %lu", function->index, GetLastError());
+            result = false;
+            continue;
+        }
+        uint8_t* compiledFunction = DbiLookupOrCompile((DbiCompileParams){.mode = DBI_COMPILE_MODE_FUNCTION, .function = function});
+        if ((uintptr_t)compiledFunction == function->address)
+        {
+            PeonyLogf("failed to compile! Function %s: address=%p size=%lu", symbol->Name, (void*)function->address, function->size);
             result = false;
         }
-        for (int i = 0; i < arrlen(functions); i++)
+        else
         {
-            FunctionSymbol* function = &functions[i];
-            char symbolStorage[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {0};
-            SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbolStorage;
-            symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
-            symbol->MaxNameLen = MAX_SYM_NAME;
-            bool foundSymbol = SymFromIndex(process, base, function->index, symbol);
-            if (!foundSymbol || function->size == 0)
-            {
-                PeonyLogf("SymFromIndex failed for symbol %lu: %lu", function->index, GetLastError());
-                result = false;
-                continue;
-            }
-            uint8_t* compiledFunction = DbiLookupOrCompile((DbiCompileParams){.mode = DBI_COMPILE_MODE_FUNCTION, .function = function});
-            if ((uintptr_t)compiledFunction == function->address)
-            {
-                PeonyLogf("failed to compile! Function %s: address=%p size=%lu", symbol->Name, (void*)function->address, function->size);
-                result = false;
-            }
-            else
-            {
-                PeonyLogf("Function %s: address=%p size=%lu | compiled addr=%p", symbol->Name, (void*)function->address, function->size, compiledFunction);
-            }
+            PeonyLogf("Function %s: address=%p size=%lu | compiled addr=%p", symbol->Name, (void*)function->address, function->size, compiledFunction);
         }
-        arrfree(functions);
     }
+cleanup:
+    arrfree(functions);
     SymSetOptions(options);
     return result;
 }
