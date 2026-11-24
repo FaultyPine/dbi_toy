@@ -508,7 +508,7 @@ static size_t nr_bits_set(const unsigned char *bitvector, size_t bitvector_size)
     static uint8_t table[256] = {0};
 
     if (!table_computed) {
-        for (uint8_t i = 0; i < UINT8_MAX; i++) {
+        for (unsigned int i = 0; i <= UINT8_MAX; i++) {
             uint8_t val = 0;
             uint8_t c = i;
             for (int j = 0; j < 8 && c != 0; j++) {
