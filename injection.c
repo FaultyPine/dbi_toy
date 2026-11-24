@@ -198,6 +198,11 @@ static CodeCache g_codeCache;
 static PendingExitPatchEntry* g_pendingExitPatches;
 static INIT_ONCE g_dbiHeapInitOnce = INIT_ONCE_STATIC_INIT;
 static mi_heap_t* g_dbiHeap;
+static struct 
+{
+    IndirectPatchSite* next;
+    size_t remaining;
+} g_indirectPatchCache;
 
 typedef struct
 {
@@ -224,9 +229,8 @@ static uint32_t g_xsaveMaskHigh __attribute__((used));
 |.define DBI_STATE_REG, r10
 
 // Stay in signed rel32 +/- 2 GB range when searching for nearby code-cache memory
-static const uintptr_t DBI_CODE_CACHE_NEAR_SEARCH_RADIUS = 0x70000000ULL;
+static const uintptr_t REL32_NEAR_SEARCH_RADIUS = 0x70000000ULL;
 #define DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC -1
-#define DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC_AND_EMIT_INLINE_CACHE_STORE -2
 
 void Initialize();
 DWORD WINAPI InitializeThread(LPVOID param);
@@ -413,7 +417,7 @@ static void LogCompiledBasicBlockComparison(
     uint8_t* cacheEnd)
 {
     PeonyLogf(
-        "\n--------------------\nBasic block compile comparison app [%p, %p) -> cache [%p, %p)",
+        "\n--------------------\nBasic block compile comparison | app [%p, %p) -> cache [%p, %p)",
         (void*)appStart,
         (void*)appEnd,
         cacheStart,
@@ -877,6 +881,47 @@ static void CodeCachePublish(uintptr_t appPc, uintptr_t appEndPc, uint8_t* block
     CodeCachePatchPendingExits(appPc, blockStart);
 }
 
+// tries to allocate contiguous memory as close to nearThis, nearThis + size] as possible
+void* TryAllocateNearAddr(uintptr_t nearThis, size_t size)
+{
+    // here we start at nearThis and fan out in both directions
+    // up and down in memory (+ and -)
+    // trying to find a contiguous <size> block of available memory we can allocate
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    uintptr_t granularity = sysInfo.dwAllocationGranularity;
+    uintptr_t anchor = AlignDownToPowerOfTwo(nearThis, granularity);
+
+    for (uintptr_t distance = 0; distance < REL32_NEAR_SEARCH_RADIUS; distance += granularity)
+    {
+        uintptr_t candidates[2] = {anchor + distance, anchor - distance};
+        for (int i = 0; i < 2; i++)
+        {
+            uintptr_t address = candidates[i];
+            // check end bounds, start bounds is checked after allocating
+            if (address < granularity || !IsRel32Reachable(nearThis + size, address)) 
+            {
+                continue;
+            }
+
+            uint8_t* memory = (uint8_t*)VirtualAlloc(
+                (void*)address,
+                size,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_EXECUTE_READWRITE);
+            if (memory && IsRel32Reachable((uintptr_t)memory, nearThis))
+            {
+                return memory;
+            }
+            if (memory)
+            {
+                VirtualFree(memory, 0, MEM_RELEASE);
+            }
+        }
+    }
+    return NULL;
+}
+
 // tries to initialize code cache memory within rel32 range of 'nearPc'
 // if we can get our code cache within rel32 range, we can relocate rip-relative stuff much easier/more consistently
 // if we can't get it nearby, we still initialize, but some rip-relative stuff might be more complicated to properly jit
@@ -887,47 +932,17 @@ bool CodeCacheInit(uintptr_t nearPc)
     {
         return true;
     }
-    
-    // here we start at nearPc and fan out in both directions
-    // up and down in memory (+ and -)
-    // trying to find a contiguous DBI_CODE_CACHE_SIZE block of available memory we can allocate for our code cache
 
     // TODO: allocate multiple code cache arenas, so when we go to reserve from the code cache, we can try our best to 
     // pick an arena within +-2GB from that original block's PC. Right now we only allocate 1 arena.
-
-    SYSTEM_INFO sysInfo;
-    GetSystemInfo(&sysInfo);
-    uintptr_t granularity = sysInfo.dwAllocationGranularity;
-    uintptr_t anchor = AlignDownToPowerOfTwo(nearPc, granularity);
-
-    for (uintptr_t distance = 0; distance < DBI_CODE_CACHE_NEAR_SEARCH_RADIUS; distance += granularity)
+    void* memory = TryAllocateNearAddr(nearPc, DBI_CODE_CACHE_SIZE);
+    if (memory)
     {
-        uintptr_t candidates[2] = {anchor + distance, anchor - distance};
-        for (int i = 0; i < 2; i++)
-        {
-            if (candidates[i] < granularity)
-            {
-                continue;
-            }
-
-            uint8_t* memory = (uint8_t*)VirtualAlloc(
-                (void*)candidates[i],
-                DBI_CODE_CACHE_SIZE,
-                MEM_RESERVE | MEM_COMMIT,
-                PAGE_EXECUTE_READWRITE);
-            if (memory && IsRel32Reachable((uintptr_t)memory, nearPc))
-            {
-                g_codeCache.base = memory;
-                g_codeCache.capacity = DBI_CODE_CACHE_SIZE;
-                g_codeCache.used = 0;
-                PeonyLogf("Code cache allocated at %p near %p", memory, (void*)nearPc);
-                return true;
-            }
-            if (memory)
-            {
-                VirtualFree(memory, 0, MEM_RELEASE);
-            }
-        }
+        g_codeCache.base = memory;
+        g_codeCache.capacity = DBI_CODE_CACHE_SIZE;
+        g_codeCache.used = 0;
+        PeonyLogf("Code cache allocated at %p near %p", memory, (void*)nearPc);
+        return true;
     }
 
     g_codeCache.base = (uint8_t*)VirtualAlloc(
@@ -1119,9 +1134,10 @@ bool EmitAndPossiblyRelocateInstruction(
 
 static void DbiEmitExitTrampoline(
     dasm_State** Dst, 
-    uintptr_t targetAppPC)
+    uintptr_t targetAppPC,
+    IndirectPatchSite* cacheToUpdate)
 {
-    bool dispatchRegHasTargetPC = targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC || targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC_AND_EMIT_INLINE_CACHE_STORE;
+    bool dispatchRegHasTargetPC = targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC;
 
     | push DBI_STATE_REG
     if (!dispatchRegHasTargetPC)
@@ -1137,10 +1153,11 @@ static void DbiEmitExitTrampoline(
 
     | mov qword [DBI_STATE_REG], DBI_DISPATCH_REG
     
-    if (targetAppPC == DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC_AND_EMIT_INLINE_CACHE_STORE)
+    if (cacheToUpdate)
     {
+        // store the cache address in the thread context, so OnDBIExit can update it on a cache miss
         | mov64 DBI_STATE_REG, (uintptr_t)&g_hijackedThreadState.cacheToUpdate
-        | lea DBI_DISPATCH_REG, [<7] // see EmitIndirectBranchWithInlineCache
+        | lea DBI_DISPATCH_REG, [&cacheToUpdate]
         | mov qword [DBI_STATE_REG], DBI_DISPATCH_REG
     }
 
@@ -1189,7 +1206,7 @@ static bool DbiEmitPatchableExit(
 
     |=>patchLabel.label:
     // the bytes here (emitted in the below function) are what gets backpatched
-    DbiEmitExitTrampoline(Dst, targetAppPC);
+    DbiEmitExitTrampoline(Dst, targetAppPC, NULL);
     return true;
 }
 
@@ -1346,30 +1363,57 @@ static bool DbiEmitJccToLabel1(dasm_State** Dst, ZydisMnemonic mnemonic)
     }
 }
 
+static IndirectPatchSite* DbiAllocateIndirectBranchCacheEntry()
+{
+    // lazy initializes the cache, and also resizes when empty
+    if (!g_indirectPatchCache.remaining)
+    {
+        SYSTEM_INFO sysInfo;
+        GetSystemInfo(&sysInfo);
+        uintptr_t cacheEntryBlockSize = sysInfo.dwAllocationGranularity; // allocate 4k pages at a time
+        uintptr_t allocateNearThis = (uintptr_t)g_codeCache.base;
+        void* indirectPatchCacheMemoryBlock = TryAllocateNearAddr(allocateNearThis, cacheEntryBlockSize);
+        if (!indirectPatchCacheMemoryBlock)
+        {
+            PeonyLogf("Failed to allocate indirect branch cache block near %p\n", allocateNearThis);
+            return NULL;
+        }
+        g_indirectPatchCache.next = indirectPatchCacheMemoryBlock;
+        g_indirectPatchCache.remaining = cacheEntryBlockSize / sizeof(*g_indirectPatchCache.next);
+    }
+    assert(g_indirectPatchCache.remaining > 0);
+    g_indirectPatchCache.remaining--;
+    return g_indirectPatchCache.next++;
+}
+
 bool EmitIndirectBranchWithInlineCache(
     dasm_State** Dst,
     CodePatchLabel** patchLabels)
 {
+    IndirectPatchSite* patchSite = DbiAllocateIndirectBranchCacheEntry();
+    if (!patchSite)
+    {
+        return false;
+    }
+    uint8_t* keyAddr = (uint8_t*)&patchSite->indirectKey;
+    uint8_t* valAddr = (uint8_t*)&patchSite->indirectValue;
+
     | pushfq
     // inline cache of the indirect target addr
     // since the target address coming in is one that points to the actual app code,
     // we need to translate it to the equiv addr in da code cache
     // we could do that through our trampoline, but that's slow, so we put what is 
     // basically a single-entry key-value map in the code itself. So if the app address doesn't change, we hit the same code cache addr every time.
-    | cmp DBI_DISPATCH_REG, qword [>7]
+    | cmp DBI_DISPATCH_REG, qword [&keyAddr]
     // x64 has no conditional jump through a memory operand, so we need this extra one
     | jne >9
     | popfq
     | pop DBI_DISPATCH_REG // ? needed?
-    | jmp qword [>8]
-    |7:
-    |.qword 0
-    |8: // value
-    |.qword 0
+    | jmp qword [&valAddr]
     |9:
     | popfq
     
-    DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC_AND_EMIT_INLINE_CACHE_STORE);
+    DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC, patchSite);
     return true;
 }
 

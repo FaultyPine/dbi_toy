@@ -21,7 +21,6 @@ TODO:
 - idea:
     - dynamorio's goal is to instrument arbitrary programs, while remaining completely transparent. This makes things difficult.
     - we could probably make a much more performant JIT by relaxing our constraints and allowing us to enforce rules about which programs are supported.
-    - Like, we could require available symbols. That way, we could determine where all the relevant functions are in a module, and pre-jit it before hijacking a thread.
     - We also don't need perfect transparency, so instead of a hashtable cache for returns, we could emit an actual return directly to code cache.
         - dynamorio paper said poor indirect branch handling for returns can result in 20% perf hit. Using raw return can much more closely mimic perf of a native program.
         - would mean some stuff could break. Like programs using __ReturnAddress intrinsic. 
