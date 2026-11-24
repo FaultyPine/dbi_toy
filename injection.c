@@ -16,8 +16,6 @@
 #include <string.h>
 #include <windows.h>
 #include <TlHelp32.h>
-// Use libpdb's CodeView definitions instead of DbgHelp's fallback enums.
-#include "pdb/cvconst.h"
 #include <dbghelp.h>
 #include <intrin.h>
 #include "Zydis.h"
@@ -292,7 +290,6 @@ static void DbiFree(void* ptr)
 {
     mi_free(ptr);
 }
-
 
 BOOL WINAPI DllMain(
     HINSTANCE hinstDLL,
@@ -1608,29 +1605,6 @@ bool CompileBlockTerminator(
     return false;
 }
 
-typedef struct
-{
-    ULONG index;
-    uintptr_t address;
-    ULONG size;
-} FunctionSymbol;
-
-typedef enum
-{
-    DBI_COMPILE_MODE_BASIC_BLOCK,
-    DBI_COMPILE_MODE_FUNCTION,
-} DbiCompileMode;
-
-typedef struct
-{
-    DbiCompileMode mode;
-    union
-    {
-        FunctionSymbol* function; // compiling a whole function
-        uintptr_t appPc; // compiling a basic block
-    };
-} DbiCompileParams;
-
 // TODO: interesting idea: what if we removed the execute permissions on the pages of memory for modules we care about
 // and install an exception handler to catch when any thread tries to execute that code. 
 // Then we dbilookuporcompile, restore exe permissions, and jump to the code cache
@@ -1638,14 +1612,13 @@ typedef struct
 // instead of what we have now where we just pick a single thread and start jitting from there
 
 
-uint8_t* DbiCompile(DbiCompileParams params)
+uint8_t* DbiCompile(uintptr_t appPc)
 {
     dasm_State* D = NULL;
     dasm_State** Dst = &D;
     DbiDynasmInit(Dst);
     CodePatchLabel* patchLabels = NULL;
 
-    uint64_t appPc = params.mode == DBI_COMPILE_MODE_BASIC_BLOCK ? params.appPc : params.function->address;
     uint64_t currentPC = appPc;
     if (!CodeCacheInit(currentPC))
     {
@@ -1694,17 +1667,7 @@ uint8_t* DbiCompile(DbiCompileParams params)
 
         ZydisDecodedInstruction instr;
         ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-        size_t bytesAvailable = ZYDIS_MAX_INSTRUCTION_LENGTH;
-        // make sure we dont decode past the end of the function
-        if (params.mode == DBI_COMPILE_MODE_FUNCTION)
-        {
-            size_t remaining = params.function->size - (currentPC - appPc);
-            if (remaining < bytesAvailable)
-            {
-                bytesAvailable = remaining;
-            }
-        }
-        ZyanStatus status = ZydisDecoderDecodeFull(&decoder, (void*)currentPC, bytesAvailable, &instr, operands);
+        ZyanStatus status = ZydisDecoderDecodeFull(&decoder, (void*)currentPC, ZYDIS_MAX_INSTRUCTION_LENGTH, &instr, operands);
         if (ZYAN_FAILED(status))
         {
             PeonyLogf("Failed to decode instruction at %p: %lu", (void*)currentPC, status);
@@ -1733,15 +1696,8 @@ uint8_t* DbiCompile(DbiCompileParams params)
         }
         currentPC += instr.length;
         
-        bool shouldStopCompiling =  (params.mode == DBI_COMPILE_MODE_BASIC_BLOCK && isTerminator) ||
-                                    (params.mode == DBI_COMPILE_MODE_FUNCTION    && currentPC >= appPc + params.function->size);
-        if (shouldStopCompiling)
+        if (isTerminator)
         {
-            if (!isTerminator)
-            {
-                // if for some reason a function ends without a terminator, dispatch to the next original address
-                DbiEmitPatchableExit(Dst, currentPC, &patchLabels);
-            }
             break;
         }
     }
@@ -1773,18 +1729,19 @@ uint8_t* DbiCompile(DbiCompileParams params)
 error:
     arrfree(patchLabels);
     dasm_free(Dst);
+    assert(false && "Dbi failed, we could fallback to normal application code, but aren't right now.");
     return (uint8_t*)appPc;
 }
 
-uint8_t* DbiLookupOrCompile(DbiCompileParams params)
+uint8_t* DbiLookupOrCompile(uintptr_t appPc)
 {
-    uint8_t* existingCodeCacheEntryForThisPc = CodeCacheLookup(params.mode == DBI_COMPILE_MODE_BASIC_BLOCK ? params.appPc : params.function->address);
+    uint8_t* existingCodeCacheEntryForThisPc = CodeCacheLookup(appPc);
     if (existingCodeCacheEntryForThisPc)
     {
         return existingCodeCacheEntryForThisPc;
     }
     // we didn't find an entry in the code cache for this pc, we need to compile this basic block
-    return DbiCompile(params);
+    return DbiCompile(appPc);
 }
 
 __declspec(noinline)
@@ -1794,7 +1751,7 @@ void OnDBIExit(ThreadHijackState* state)
     #if DBI_LOG_COMPILATION_VERBOSE
     PeonyLogf("Dispatching to app PC %p", (void*)appTargetRip);
     #endif
-    uint8_t* codeCacheRip = DbiLookupOrCompile((DbiCompileParams){.mode = DBI_COMPILE_MODE_BASIC_BLOCK, .appPc = appTargetRip});
+    uint8_t* codeCacheRip = DbiLookupOrCompile(appTargetRip);
     state->savedRegs.Rip = (DWORD64)codeCacheRip;
     if (state->cacheToUpdate)
     {
@@ -2187,21 +2144,6 @@ static bool DbiInitializeExtendedState(void)
     g_xsaveMaskHigh = (uint32_t)(xsaveMask >> 32);
     PeonyLogf("XSAVE enabled: mask=%llX size=%lu", xsaveMask, xsaveSize);
     return true;
-}
-
-static BOOL CALLBACK CollectFunctionSymbol(PSYMBOL_INFO symbol, ULONG size, PVOID context)
-{
-    (void)size;
-    if (symbol->Tag == SymTagFunction)
-    {
-        FunctionSymbol** functions = (FunctionSymbol**)context;
-        FunctionSymbol function = {0};
-        function.index = symbol->Index;
-        function.address = (uintptr_t)symbol->Address;
-        function.size = symbol->Size;
-        arrput(*functions, function);
-    }
-    return TRUE;
 }
 
 #define DEBUG_PICK_THREAD_CONTAINS_NAME "main"
