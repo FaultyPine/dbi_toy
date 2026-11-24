@@ -2271,7 +2271,6 @@ static bool CompileModule(HMODULE module)
         goto cleanup;
     }
 
-
     // TODO: libpdb docs say "At this point, the original backing storage for `pdbdata` can be safely freed."
     // that means they probably copy the data into this process. I'd like to avoid that in the future, and just used the mmapped pdb file during parsing...
     if (pdb_load(pdbCtx, pdbdata, pdbFileSize))
@@ -2280,6 +2279,32 @@ static bool CompileModule(HMODULE module)
         result = false;
         goto cleanup;
     }
+
+
+    uint32_t numSymbols = 0;
+    int pdbResult = pdb_get_nr_symbols(pdbCtx, &numSymbols);
+    assert(pdbResult == 0);
+    const SYMTYPE** symbols = DbiAlloc((size_t)numSymbols * sizeof(*symbols));
+    pdbResult = pdb_get_symbols(pdbCtx, symbols);
+    assert(pdbResult == 0);
+    for (uint32_t i = 0; i < numSymbols; i++)
+    {
+        const SYMTYPE* symbolRoot = symbols[i];
+        if (symbolRoot->rectyp == S_PUB32)
+        {
+            // TODO: inlined functions need special handling. S_INLINESITE is inside the parent function's debug stream
+            const PUBSYM32* symbol = (const PUBSYM32*)symbolRoot;
+            if (symbol->pubsymflags.fFunction)
+            {
+                PeonyLogf("Function sym: %s", symbol->name);
+                uint32_t sectionId = symbol->seg;
+                uint32_t offset = symbol->off;
+
+
+            }
+        }
+    }
+    DbiFree(symbols);
 
 #endif
 

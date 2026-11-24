@@ -78,6 +78,13 @@ void ThreadSetName(const char* threadName)
     #endif
 }
 
+// note: does not appear in symbols
+__forceinline
+uint64_t DoSomethingPlease(uint64_t x)
+{
+    return x + 1;
+}
+
 __declspec(noinline)
 uint64_t DbiHotLoop(uint64_t seed)
 {
@@ -93,6 +100,7 @@ uint64_t DbiHotLoop(uint64_t seed)
         {
             x = (x * 33) + (i | 1);
         }
+        x = DoSomethingPlease(x);
     }
     return x;
 }
