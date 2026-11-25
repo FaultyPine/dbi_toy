@@ -4,11 +4,13 @@ Building: run `build.bat`. Or `build.bat release` for an optimized build
 trying to learn how to write a DBI engine
 
 
-currently supports:
-- injecting into a target process/thread, or waiting for an exe with a given name to spawn
+tech:
+- injecting into a target process/thread
 - relocating rip-relative instructions
 - emitting basic block terminators that dispatch back into the DBI
 - backpatching code cache blocks (direct and indirect branches)
+- shared mem communication between the main "control" process, and the target app instrumented process
+- exceptions print the surrounding code cache & original app instructions for comparison
 
 TODO:
 - handle indirect branches better
