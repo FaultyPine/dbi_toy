@@ -1395,20 +1395,44 @@ bool EmitIndirectBranchWithInlineCache(
     uint8_t* keyAddr = (uint8_t*)&patchSite->indirectKey;
     uint8_t* valAddr = (uint8_t*)&patchSite->indirectValue;
 
-    | pushfq
+    // from comparing the performance of this DBI to other public ones, there was a difference here in flag preserving work.... 
+    // i was initially doing push/popfq
+    // https://github.com/DynamoRIO/dynamorio/blob/43a59e46041593919152e546578f6f167a3999ae/ext/drx/drx.c#L252
+    // https://github.com/DynamoRIO/dynamorio/blob/43a59e46041593919152e546578f6f167a3999ae/core/lib/instrument.c#L5901
+    // https://dynamorio.org/dr__ir__utils_8h.html#a8c579801a00ce256038664288a5f8909
+    // CMP changes only some flags
+    // https://www.felixcloutier.com/x86/cmp
+    // Flags Affected
+    // "The CF, OF, SF, ZF, AF, and PF flags are set according to the result."
+    // So using push/popfq does a lot of useless work saving/restoring other flags
+    // we have lahf/sahf to load/store just these particular relevant flags.
+    // but lahf/sahf don't save the OF flag...
+    // https://www.felixcloutier.com/x86/lahf  "Load: AH := EFLAGS(SF:ZF:0:AF:0:PF:1:CF)."
+    // which cmp could set according to above, so we "seto al" to preserve that too.
+    // https://llvm.org/docs/SpeculativeLoadHardening.html
+    // "On newer x86 processors we can use the lahf and sahf instructions to save all of the flags besides the overflow flag in a register rather than on the stack. 
+    // We can then use seto and add to save and restore the overflow flag in a register. Combined, this will save and restore flags in the same manner as above but using two registers rather than the stack. 
+    // That is still very expensive if slightly less expensive than pushf and popf in most cases"
+
+    | push rax // need to save/restore rax because lahf/sahf use it
+    | lahf
+    | seto al
     // inline cache of the indirect target addr
     // since the target address coming in is one that points to the actual app code,
     // we need to translate it to the equiv addr in da code cache
-    // we could do that through our trampoline, but that's slow, so we put what is 
-    // basically a single-entry key-value map in the code itself. So if the app address doesn't change, we hit the same code cache addr every time.
+    // we could do that through our trampoline, but that's slow. using a dedicated cache ends up being way faster.
     | cmp DBI_DISPATCH_REG, qword [&keyAddr]
     // x64 has no conditional jump through a memory operand, so we need this extra one
     | jne >9
-    | popfq
-    | pop DBI_DISPATCH_REG // ? needed?
+    | add al, 0x7f
+    | sahf
+    | pop rax
+    | pop DBI_DISPATCH_REG // since we expect the caller to have pushed dbi_dispatch_reg
     | jmp qword [&valAddr]
     |9:
-    | popfq
+    | add al, 0x7f
+    | sahf
+    | pop rax
     
     DbiEmitExitTrampoline(Dst, DBI_EXIT_TRAMPOLINE_INDICATE_DISPATCH_REG_HAS_TARGET_PC, patchSite);
     return true;
