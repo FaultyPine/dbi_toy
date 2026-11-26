@@ -17,7 +17,7 @@ static BuildMode g_buildMode = DEBUG;
 static void append_build_flags(Nob_Cmd *cmd)
 {
     // Use the same static CRT as Zydis and Zycore in both build modes.
-    nob_cmd_append(cmd, "-fms-runtime-lib=static");
+    nob_cmd_append(cmd, "-fms-runtime-lib=static", "-mcx16");
     if (g_buildMode == RELEASE)
     {
         nob_cmd_append(cmd, "-O2", "-DNDEBUG");

@@ -196,11 +196,28 @@ static CodeCache g_codeCache;
 static PendingExitPatchEntry* g_pendingExitPatches;
 static INIT_ONCE g_dbiHeapInitOnce = INIT_ONCE_STATIC_INIT;
 static mi_heap_t* g_dbiHeap;
-static struct 
+
+typedef struct 
 {
-    IndirectPatchSite* next;
-    size_t remaining;
-} g_indirectPatchCache;
+    _Alignas(16) LONG64 low;
+    LONG64 high;
+} Int128;
+
+
+typedef struct 
+{
+    union
+    {
+        struct
+        {
+            _Alignas(16) size_t remaining;
+            IndirectPatchSite* next;
+        };
+        Int128 combined;
+    };
+} IndirectPatchCache;
+
+IndirectPatchCache g_indirectPatchCache;
 
 typedef struct
 {
@@ -1360,28 +1377,66 @@ static bool DbiEmitJccToLabel1(dasm_State** Dst, ZydisMnemonic mnemonic)
     }
 }
 
+void AtomicLoad128(volatile Int128* src, Int128* dest) 
+{
+    // windows doesn't have a load, so cmpxchg can basically be the same thing
+    *dest = (Int128){0};
+    InterlockedCompareExchange128(
+        (volatile LONG64*)src,
+        0, // ExchangeHigh
+        0, // ExchangeLow
+        (LONG64*)dest
+    );
+}
+
 static IndirectPatchSite* DbiAllocateIndirectBranchCacheEntry()
 {
+    IndirectPatchCache current = {0};
+    AtomicLoad128(&g_indirectPatchCache.combined, &current.combined);
     // lazy initializes the cache, and also resizes when empty
-    if (!g_indirectPatchCache.remaining)
+    if (!current.remaining)
     {
         SYSTEM_INFO sysInfo;
         GetSystemInfo(&sysInfo);
         uintptr_t cacheEntryBlockSize = sysInfo.dwAllocationGranularity; // allocate 4k pages at a time
-        assert(cacheEntryBlockSize % sizeof(IndirectPatchSite) == 0);
+        assert(cacheEntryBlockSize % sizeof(IndirectPatchCache) == 0);
         uintptr_t allocateNearThis = (uintptr_t)g_codeCache.base;
-        void* indirectPatchCacheMemoryBlock = TryAllocateNearAddr(allocateNearThis, cacheEntryBlockSize);
-        if (!indirectPatchCacheMemoryBlock)
+        _Alignas(16) void* indirectPatchCacheMemoryBlock = 0;
+        size_t newRemaining = cacheEntryBlockSize / sizeof(*g_indirectPatchCache.next);
+        do 
         {
-            PeonyLogf("Failed to allocate indirect branch cache block near %p\n", allocateNearThis);
-            return NULL;
-        }
-        g_indirectPatchCache.next = indirectPatchCacheMemoryBlock;
-        g_indirectPatchCache.remaining = cacheEntryBlockSize / sizeof(*g_indirectPatchCache.next);
+            if (indirectPatchCacheMemoryBlock)
+            {
+                VirtualFree(indirectPatchCacheMemoryBlock, 0, MEM_RELEASE);
+                AtomicLoad128(&g_indirectPatchCache.combined, &current.combined);
+            }
+            if (current.remaining)
+            {
+                break;
+            }
+            indirectPatchCacheMemoryBlock = TryAllocateNearAddr(allocateNearThis, cacheEntryBlockSize);
+            if (!indirectPatchCacheMemoryBlock)
+            {
+                PeonyLogf("Failed to allocate indirect branch cache block near %p\n", allocateNearThis);
+                return NULL;
+            }
+        } while (InterlockedCompareExchange128((LONG64*)&g_indirectPatchCache.combined, (LONG64)indirectPatchCacheMemoryBlock, newRemaining, (LONG64*)&current) == 0);
     }
-    assert(g_indirectPatchCache.remaining > 0);
-    g_indirectPatchCache.remaining--;
-    return g_indirectPatchCache.next++;
+    
+    IndirectPatchCache comperand = {0};
+    IndirectPatchCache new = {0};
+    do
+    {
+        AtomicLoad128(&g_indirectPatchCache.combined, &comperand.combined);
+        new = comperand;
+        if (new.remaining == 0)
+        {
+            return DbiAllocateIndirectBranchCacheEntry();
+        }
+        new.next++;
+        new.remaining--;
+    } while (InterlockedCompareExchange128((LONG64*)&g_indirectPatchCache.combined, new.combined.high, new.combined.low, (LONG64*)&comperand) == 0);
+    return comperand.next;
 }
 
 bool EmitIndirectBranchWithInlineCache(
