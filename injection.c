@@ -1368,6 +1368,7 @@ static IndirectPatchSite* DbiAllocateIndirectBranchCacheEntry()
         SYSTEM_INFO sysInfo;
         GetSystemInfo(&sysInfo);
         uintptr_t cacheEntryBlockSize = sysInfo.dwAllocationGranularity; // allocate 4k pages at a time
+        assert(cacheEntryBlockSize % sizeof(IndirectPatchSite) == 0);
         uintptr_t allocateNearThis = (uintptr_t)g_codeCache.base;
         void* indirectPatchCacheMemoryBlock = TryAllocateNearAddr(allocateNearThis, cacheEntryBlockSize);
         if (!indirectPatchCacheMemoryBlock)
