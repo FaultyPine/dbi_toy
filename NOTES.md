@@ -90,3 +90,26 @@ mov rbx, [r14 + slot2]
 ^ is a simple and slower way of doing it.
 A more complex but faster way is to do real dataflow analysis of live/dead registers, to decide which ones are available for scratch work and use those.
 "A guest register is live at a point if its current value may be read later before being overwritten." If <- is not the case, the reg is "dead" and we can just use it as scratch.
+
+
+
+### Dynamorio paper notes:
+
+"This results in a discrepancy in branch prediction for returns versus indirect jumps and indirect calls. This discrepancy is the single largest obstacle toward achieving comparable-to-native performance on IA-32. Since return addresses in DynamoRIO must be translated using an indirect branch lookup(for transparency– see Section 3.3.3), the return instruction cannot be used in a straightforward manner. Instead, an indirect jump is used, which results in poor branch prediction compared to the native version of the code."
+
+"We came up with numerous indirect branch lookup designs that tried to make use of the RSB. The obvious one is to violate transparency and place code cache return addresses, rather than original
+application addresses, on the stack"
+
+"This scheme has several other problems besides application transparency. One is that if we do not take over the application at the very beginning, we may see returns for which we never saw the call."
+
+dynamorio says their single biggest obstacle to getting near-native performance out of the DBI is that return instructions use an indirect branch cache, as opposed to native returns.
+The paper just before this talks about how there is dedicated hardware (Return Stack Buffer) to predict the target address of return instructions.
+Dynamorio doesn't do native returns because it would violate transparency (a code cache address would be the target of the return)
+but relaxing that constraint here i think is reasonable, and will give (once i implement it) a big perf boost
+We cannot do native returns if you attach to a program mid-run (since we might end up losing control of the program if a code cache return returns to original app code) (maybe solvable via virtualprotect-ing original program module?)
+So the best way to run this will be to run your program entirely under this dbi from the start. Maybe we can allow both attaching and running from the beginning, with attaching just ignoring the native return optimization.
+
+
+Dynamorio's indirect branch cache (section 4.3):
+"DynamoRIO inlines only the lookup of the first member of the hashtable collision chain at each return site. A miss there moves on to a shared lookup routine that continues the collision chain walk"
+
