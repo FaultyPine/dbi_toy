@@ -1413,6 +1413,7 @@ bool EmitIndirectBranchWithInlineCache(
     // "On newer x86 processors we can use the lahf and sahf instructions to save all of the flags besides the overflow flag in a register rather than on the stack. 
     // We can then use seto and add to save and restore the overflow flag in a register. Combined, this will save and restore flags in the same manner as above but using two registers rather than the stack. 
     // That is still very expensive if slightly less expensive than pushf and popf in most cases"
+    // also see the Dynamorio paper linked in the readme section 4.4 Condition Codes
 
     | push rax // need to save/restore rax because lahf/sahf use it
     | lahf
